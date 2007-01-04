@@ -1,6 +1,6 @@
 #! /usr/local/bin/perl -w
 #
-# fuse1.pl -- a searchable filesystem metadata store for Linux
+# mmfs_fuse.pl -- a searchable filesystem metadata store for Linux
 # by pts@fazekas.hu at Thu Jan  4 20:07:30 CET 2007
 #
 # This program is free software; you can redistribute it and/or modify
@@ -115,10 +115,9 @@ sub config_get($;$) {
   defined $config{$key} ? $config{$key} : $default
 }
 
-# --- Database functions
+# --- Generic MySQL database functions
 
 my $dbh;
-my $all_fs=config_get('all.fs',''); # !!
 
 #** @return :DBI::db
 sub db_connect() {
@@ -129,11 +128,14 @@ sub db_connect() {
       { #defined $attrs{RootClass} ? ( RootClass => $attrs{RootClass} ) : (),
         RaiseError=>1, PrintError=>0, AutoCommit=>1 });
     die if !ref $dbh; # Dat: not reached, error already raised
-    die unless $dbh->do(q(SET NAMES 'utf8' COLLATE 'utf8_general_ci'));
+    # Imp: adjust connection timeout to high value
+    # vvv Dat: auto reconnect needs AutoComment=>1, see `perldoc DBD::mysql'
+    $dbh->{mysql_auto_reconnect}=1; # Imp: verify...
+    die unless db_do(q(SET NAMES 'utf8' COLLATE 'utf8_general_ci'));
     my $N=1;
     my $sql;
     while (defined($sql=config_get("db.onconnect.$N"))) {
-      die unless $dbh->do($sql);
+      die unless db_do($sql);
       $N++
     }
   }
@@ -153,6 +155,45 @@ sub db_query {
   $sth
 }
 
+#** Like $dbh->selectall_arrayref(), but uses $dbh->prepare_cached(), and
+#** doesn't need \%attr
+sub db_query_all {
+  db_query(@_)->fetchall_arrayref()
+}
+
+#** Like $dbh->do(), but uses $dbh->prepare_cached(), and
+#** doesn't need \%attr
+sub db_do {
+  my($sql)=shift; my $dbh_self=($dbh or db_connect());
+  my $sth=$dbh_self->prepare_cached($sql,undef,1); # Imp: 3 is safer than 1 -- do we need it?
+  my $rv=$sth->execute(@_);
+  $sth->finish();
+  $rv
+}
+
+#** See mysql/mysqld_ername.h
+sub ER_DUP_ENTRY() { 1062 }
+
+sub db_transaction($) {
+  my($sub)=@_;
+  die "already in transaction\n" if db_connect()->{AutoCommit};
+  $dbh->begin_work();
+  my $ret=eval { $sub->() }; # Imp: wantarray()
+  if ($@) {
+    $dbh->rollback() if !$dbh->{AutoCommit};
+    die $@;
+  } else {
+    $dbh->commit() if !$dbh->{AutoCommit};
+  }
+  $ret
+}
+
+# -- movemetafs-specific database routines
+
+my $all_fs=config_get('all.fs','F'); # !!
+my $all_dev; # st_dev of "$root_prefix/."
+die if 0==length($all_fs);
+
 sub verify_tag($) {
   my($tag)=@_;
   die "bad tag\n" if $tag!~/\A[0-9a-zA-Z_\x80-\xFF]{1,255}\Z(?!\n)/;
@@ -160,21 +201,18 @@ sub verify_tag($) {
   undef
 }
 
-#** See mysql/mysqld_ername.h
-sub ER_DUP_ENTRY() { 1062 }
-
-sub insert_tag($) {
+sub db_insert_tag($) {
   my($tag)=@_;
   verify_tag($tag);
-  #my $rv=db_connect()->do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'') ON DUPLICATE KEY UPDATE tag=?", undef, $tag, $tag) };
+  #my $rv=db_do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'') ON DUPLICATE KEY UPDATE tag=?", $tag, $tag) };
   # Dat: $rv==1: inserted, $rv==2: updated. Where is this documented?
-  eval { db_connect()->do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'')", undef, $tag) };
+  eval { db_do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'')", $tag) };
   die "tag already exists\n" if $@ and $dbh->err==ER_DUP_ENTRY;
   die $@ if $@;
   undef
 }
 
-sub delete_tag($) {
+sub db_delete_tag($) {
   my($tag)=@_;
   verify_tag($tag);
   db_connect()->begin_work();
@@ -185,7 +223,7 @@ sub delete_tag($) {
     die "tag is in use\n";
   }
   $sth->finish();
-  my $num_rows=0+db_connect()->do("DELETE FROM tags WHERE tag=?", undef, $tag);
+  my $num_rows=0+db_do("DELETE FROM tags WHERE tag=?", $tag);
   $dbh->commit();
   die "tag not found\n" if !$num_rows;
   #die "tag already exists" if $dbh->err==ER_DUP_ENTRY;
@@ -193,15 +231,35 @@ sub delete_tag($) {
   undef
 }
 
-my $sth=db_query("SHOW TABLES");
-my $ar;
-while ($ar=$sth->fetchrow_arrayref()) { print "@$ar.\n" }
-print "qdone\n";
-$sth=db_query("SHOW TABLES");
-while ($ar=$sth->fetchrow_arrayref()) { print "@$ar.\n" }
-print "qdone\n";
-insert_tag("vacation");
-delete_tag("vacation");
+sub db_have_tag($) {
+  my($tag)=@_;
+  print STDERR "DB_HAVE_TAG($tag)\n";
+  # Imp: is COUNT(*) faster?
+  my $sth=db_query("SELECT 1 FROM tags WHERE tag=? LIMIT 1",$tag);
+  my $ret=($sth->fetchrow_array()) ? 1 : 0;
+  print STDERR "DB_HAVE_TAG($tag) = $ret\n";
+  $sth->finish();
+  $ret
+}
+
+#** @return :List(String) tags
+sub db_tags() {
+  print STDERR "DB_TAGS()\n";
+  map { $_->[0] } @{db_query_all(
+    "SELECT tag FROM tags GROUP BY tag ORDER BY tag")}
+}
+
+
+
+#my $sth=db_query("SHOW TABLES");
+#my $ar;
+#while ($ar=$sth->fetchrow_arrayref()) { print "@$ar.\n" }
+#print "qdone\n";
+#$sth=db_query("SHOW TABLES");
+#while ($ar=$sth->fetchrow_arrayref()) { print "@$ar.\n" }
+#print "qdone\n";
+#db_insert_tag("vacation");
+#db_delete_tag("vacation");
 
 #** @param $_[0] shortname
 sub shorten_with_ext_bang($) {
@@ -213,22 +271,24 @@ sub shorten_with_ext_bang($) {
 }
 
 #** @return :Boolean
-sub db_have_other_shortname($$) {
-  my($shortprincipal,$ino,$fs)=@_;
-  # !!
-  # ('SELECT COUNT(*) FROM files WHERE shortprincipal=? AND (ino<>? OR fs<>?)',
-  #    $shortname, $ino, $fs)
+sub db_have_other_shortname($$$) {
+  my($shortprincipal,$fs,$ino)=@_;
+  # vvv Imp: faster than COUNT(*)?
+  my $L=db_query_all(
+    "SELECT COUNT(*) FROM files WHERE shortprincipal=? AND (ino<>? OR fs<>?)",
+    $shortprincipal, $ino,$fs);
+  $L->[0][0]
 }
 
-#** @return ($shortname,$shortprincipal) :String
-sub gen_shortname($$) {
-  my($principal,$ino,$fs)=@_;
+#** @return ($shortprincipal,$shortname) :Strings
+sub gen_shorts($$$) {
+  my($principal,$fs,$ino)=@_;
   my $shortname=$principal;
   $shortname=~s@\A.*/@@s;
   shorten_with_ext_bang($shortname);
   my $shortprincipal=$shortname;
   if ($shortname=~m@\A:[0-9a-f]+:@ or
-      db_have_other_shortprincipal($shortprincipal,$ino,$fs)) {
+      db_have_other_shortprincipal($shortprincipal,$fs,$ino)) {
     my $prepend=sprintf(":%x:%s:",$ino,$fs);
     die if length($prepend)>127;
     substr($shortname,0,0)=$prepend; # Dat: not largefile-safe
@@ -237,17 +297,103 @@ sub gen_shortname($$) {
   ($shortprincipal,$shortname)
 }
 
+#** :String. Empty or ends with slash. May start with slash. Doesn't contain
+#** a double slash. Empty string means current folder.
+#** $root_prefix specifies the real filesystem path to be seen in
+#** "$mpoint/root"
+my $root_prefix='';
+
+#** @return ($fs,$ino)
+sub file_principal_to_fs_ino($) {
+  my($principal)=@_;
+  my @st;
+  die "empty principal\n" if !defined $principal or 0==length($principal);
+  die "principal not found\n" unless @st=lstat($root_prefix.$principal);
+  die "principal not a file\n" if !-f _;
+  die "principal on different filesystem" if $st[0] ne $all_dev;
+  ($all_fs,$st[1]) # Imp: better than $all_fs
+}
+
+#** Ensures that table files contains $principal. !! Searches by ($fs,$ino).
+sub db_ensure_principal($;$$) {
+  my($principal,$fs,$ino)=@_;
+  db_transaction(sub {
+    if (0==$dbh->query_all("SELECT COUNT(*) FROM files WHERE principal=?", $principal)->[0][0]) {
+      # Dat: with transactions, this ensures that the same $principal is not inserted twice (really?? !! test it)
+      ($fs,$ino)=file_principal_to_fs_ino($principal) if !defined$ino; # Dat: this might die()
+      my ($shortprincipal,$shortname)=gen_shorts($principal,$fs,$ino);
+      db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?)",
+        $principal, $shortname, $shortprincipal, $ino, $fs); # Dat: this shouldn't throw
+    }
+  });
+}
+
+#** Changes files.principal of $real to $real
+sub db_rename_principal($) {
+  my($fn)=@_;
+  my $principal=$fn;
+  die "not a mirrored filename\n" if $principal!~s@\A/root/+@@;
+  my($fs,$ino)=file_principal_to_fs_ino($principal); # Dat: this might die()
+  my $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
+    $principal, $ino, $fs); # Dat: might have no effect
+  print STDERR "RENAME_PRINCIPAL principal=($principal) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+  $rv
+}
+
+sub db_add_tag($$) {
+  my($fn,$tag)=@_;
+  my $principal=$fn;
+  die "not a mirrored filename\n" if $principal!~s@\A/root/+@@;
+  print STDERR "DB_ADD_TAG principal=($principal) tag=($tag)\n" if $DEBUG;
+  my($fs,$ino)=file_principal_to_fs_ino($principal); # Dat: this might die()
+  print STDERR "DB_ADD_TAG principal=($principal) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
+  
+}
+
+#die $dbh->{AutoCommit};
+#db_connect()->begin_work();
+##die $dbh->{AutoCommit} ? 1 : 0;
+#db_connect()->rollback();
+# eval { db_query("FOO BAR"); }; die "($@)";
+
+#  principal VARBINARY(32000) NOT NULL,
+#  shortname VARBINARY(255) NOT NULL UNIQUE,
+#  shortprincipal VARBINARY(255) NOT NULL,
+#  ino INTEGER UNSIGNED NOT NULL,
+#  fs VARBINARY(127) NOT NULL,
+
+
+# vvv Imp: verify all die()s, add them here
+my %dienerrnos=(
+  'bad tag' => -1*Errno::EINVAL,
+  'bad UTF-8 string' => -1*Errno::EINVAL,
+  'tag not found' => -1*Errno::ENOENT,
+  'empty principal' => -1*Errno::EINVAL,
+  'principal not a file' => -1*Errno::ENOTSUP,
+  'principal not found' => -1*Errno::ENOENT,
+  'tag alredy exists' => -1*Errno::EEXIST,
+  'tag is in use' => -1*Errno::ENOTEMPTY,
+  'principal on different filesystem' => -1*Errno::EREMOTEIO, # Imp: test
+  'DBD::mysql::st execute failed' => -1*Errno::EIO, # Dat: by db_query()
+  'not a mirrored filename' => -1*Errno::EINVAL,
+);
+
+#** @return 0 or -1*Errno::E...
+sub diemsg_to_nerrno() {
+  return 0 if !$@;
+  my $msg=$@;
+  chomp($msg);
+  print STDERR "info: diemsg: $msg\n" if $DEBUG;
+  $msg=~s@(?::\s|\n).*@@s;
+  ($dienerrnos{$msg} or -1*Errno::EPERM)
+}
+
+
 # ---
 
 #** Absolute dir. Starts with slash. Doesn't end with slash. Doesn't contain
 #** a double slash. Isn't "/".
 my $mpoint;
-
-#** :String. Empty or ends with slash. Never starts with slash. Doesn't contain
-#** a double slash.
-#** $root_prefix specifies the real filesystem path to be seen in
-#** "$mpoint/root"
-my $root_prefix='';
 
 my $read_only_p=0;
 
@@ -286,8 +432,10 @@ END { cleanup_umount(); }
 sub sub_to_real($) {
   my $fn=$_[0];
   return undef if $fn!~s@\A/root(?=/|\Z(?!\n))@@;
-  substr($fn,0,0)=$root_prefix;
+  ## Dat: now substr($fn,0,1) eq '/', so an empty root_prefix would yield /
+  substr($fn,0,0)=(0==length($root_prefix)) ? '.' : $root_prefix;
   $fn="/" if 0==length($fn);
+  #print STDERR "SUB_TO_REAL() real=$fn\n";
   return (substr($fn,0,length($mpoint)) eq $mpoint and
     (length($fn)==length($mpoint) or substr($fn,length($mpoint),1)eq"/") ) ?
     undef : $fn
@@ -323,8 +471,6 @@ sub O_EXCL()  { 0200 }  # not fcntl
 # Dat: from /usr/include/attr/xattr.h
 sub Errno::ENOATTR() { Errno::ENODATA }
 
-my %tags=qw(indoors 1 outdoors 1);
-
 #** Dat: GETATTR is similar to lstat().
 #** Dat: GETATTR is called for all components before an open():
 #**        GETATTR(/root)
@@ -352,7 +498,7 @@ sub my_getattr($) {
   } elsif ($fn eq '/tag') { # Imp: handle /tag/*
   } elsif ($fn=~m@\A/tag/([^/]+)\Z(?!\n)@) { # Dat: ls(!) and zsh(1) echo tag/* needs it
     my $subdir=$1;
-    return -1*Errno::ENOENT if !defined $tags{$subdir};
+    return -1*Errno::ENOENT if !db_have_tag($subdir);
     $mode=($mode&0644)|S_IFDIR;
   } elsif ($fn eq '/root') {
   } elsif (defined($real=sub_to_real($fn))) {
@@ -378,7 +524,7 @@ sub my_getdir($) {
     # Dat: we need '.' and '..' for both / and others
     return ('.','..','tag','root', 0); # $errno
   } elsif ($dir eq '/tag') {
-    return ('.','..',sort(keys%tags), 0)
+    return ('.','..',db_tags(), 0)
   } elsif ($dir=~m@\A/tag/([^/]+)\Z(?!\n)@) { # Dat: ls(!) and zsh(1) echo tag/* needs it
     return ('.','..',0); # Imp: not empty dir
   } elsif (!defined($real=sub_to_real($dir))) {
@@ -494,6 +640,11 @@ sub my_rmdir($) {
   my $real;
   print STDERR "RMDIR($fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
+    if ($fn=~m@/tag/([^/]+)\Z(?!\n)@) {
+      my $tag=$1;
+      eval { db_delete_tag($tag); };
+      return diemsg_to_nerrno();
+    }
     return -1*Errno::EPERM
   } elsif (!rmdir($real)) {
     return -1*$!
@@ -505,8 +656,14 @@ sub my_rmdir($) {
 sub my_mkdir($$) {
   my($fn,$mode)=@_;
   my $real;
+  # Dat: FUSE calls: GETATTR(), MKDIR(), GETATTR()
   print STDERR "MKDIR($fn,$mode)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
+    if ($fn=~m@/tag/([^/]+)\Z(?!\n)@) {
+      my $tag=$1;
+      eval { db_insert_tag($tag); };
+      return diemsg_to_nerrno();
+    }
     return -1*Errno::EPERM
   } elsif (!mkdir($real,$mode)) {
     return -1*$!
@@ -587,13 +744,20 @@ sub my_rename($$) {
   my($oldreal,$real);
   print STDERR "RENAME($oldfn,$fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
+    if ($fn=~m@/tag/([^/]+)/[^/]+\Z(?!\n)@ and defined(sub_to_real($oldfn))) {
+      # !! move from "/tag/$tag/$shortprincipal" etc. (automatic?)
+      my $tag=$1;
+      eval { db_add_tag($oldfn,$tag) };
+      return diemsg_to_nerrno()
+    }
     return -1*Errno::EPERM
   } elsif (!defined($oldreal=sub_to_real($oldfn))) {
     return -1*Errno::EXDEV
   } elsif (!rename($oldreal,$real)) {
     return -1*$!
   } else {
-    return 0
+    eval { db_rename_principal($fn) };
+    return diemsg_to_nerrno()
   }
 }
 
@@ -721,7 +885,7 @@ sub my_listxattr($) {
     elsif ($ARGV[$I] eq '--quiet'  ) { $DEBUG-- }
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
-    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.2 2007-01-04 20:32:00 pts Exp $'."\n"; exit 0 }
+    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.3 2007-01-04 22:55:01 pts Exp $'."\n"; exit 0 }
     else { die "$0: unknown option: $ARGV[$I]\n" }
   }
   splice @ARGV, 0, $I;
@@ -730,9 +894,18 @@ sub my_listxattr($) {
 die "$0: missing --mount-point=\n" if !defined $mpoint or 0==length($mpoint);
 die "$0: cannot find mpoint\n" if !defined($mpoint=Cwd::abs_path($mpoint)) or
   substr($mpoint,0,1)ne"/" or length($mpoint)<2 or $mpoint=~m@//@;
+
 $root_prefix=~s@//+@/@g;
 $root_prefix=~s@/*\Z(?!\n)@/@;
-$root_prefix=~s@\A/+@@;
+$root_prefix=~s@\A/+@/@;
+{ my @st=lstat("$root_prefix/.");
+  die "$0: cannot stat --root-prefix=: $root_prefix\n" if !@st;
+  $all_dev=$st[0];
+  #die "all_dev=$all_dev\n";
+}
+
+db_connect();
+
 system('fusermount -u -- '.fnq($mpoint).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts
 print STDERR "starting Fuse::main on --mount-point=$mpoint\n" if $DEBUG;
 print STDERR "Press Ctrl-<C> to exit (and then umount manually).\n" if $DEBUG;
@@ -778,3 +951,6 @@ Fuse::main(mountpoint=>$mpoint,
   @ro_ops,
   ($read_only_p ? () : @write_ops),
 );
+# ^^^ Dat: might die with:
+#     fusermount: fuse device not found, try 'modprobe fuse' first
+#     could not mount fuse filesystem!

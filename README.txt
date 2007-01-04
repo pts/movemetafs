@@ -82,9 +82,10 @@ Requirements (install them in this order):
 -- Root privileges are required for some installation steps, but not for
    usage. movemetafs is just as safe as FUSE itself in a multiuser
    environment.
--- the FUSE libraries (/usr/lib/libfuse.so.?) and header files
+-- the FUSE libraries >=2.6.1 (/usr/lib/libfuse.so.?) and header files
    (/usr/include/fuse.h) (e.g. `apt-get install libfuse-dev' on Debian
-   Sarge)
+   Sarge). Please note that fuse-2.6.0_rc1 is buggy (e.g. rename() always
+   returns 0).
 -- Perl >=5.8
 -- the Fuse Perl module (install with `cpan Fuse' as root)
 -- MySQL server >=4.1 (you don't have to change your existing MySQL server
@@ -119,12 +120,12 @@ The restriction will be removed in the future.
 
 Typically, even before installing movemetafs, you have a carrier filesystem
 with a lot of files, among which you sometimes cannot easily find what you
-want. So you decide that you will use a metadata store that will let
-you tag your files, and later search for files based on the attached tags. A
-tag is just a short string such as `vacation', `2007', `Greece', `dance',
-`John' and `high_quality'. Some logic databases have more structure than
-simple tagging (such as taxonomy, thesaurus and ontology), but movemetafs
-doesn't.
+want. So you decide that you will use a metadata store that will let you tag
+your files, and later search for files based on the attached tags. A tag is
+just a short string such as `vacation', `2007', `indoors', `outdoors',
+`Greece', `dance', `John' and `high_quality'. Some logic databases have more
+structure than simple tagging (such as taxonomy, thesaurus and ontology),
+but movemetafs doesn't.
 
 Tag names match the regexp /\A[0-9a-zA-Z_\x80-\xFF]{1,255}\Z(?!\n)/, where
 255 is measured in bytes (MySQL VARCHAR(255) measures in characters.)
@@ -362,5 +363,8 @@ Improvement possibilites
 # !! check for largefile support, 64-bit filesystem access (not possible in Perl?)
 # !! keep filehandles open for FLUSH
 # !! implement POSIX extended attributes
+!! feature: test mysql_auto_reconnect
+!! examine: why are there so many GETATTR() etc. calls?
+   How to cache? Which file manager to use?
 
 __END__
