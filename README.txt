@@ -128,7 +128,7 @@ doesn't.
 
 Tag names match the regexp /\A[0-9a-zA-Z_\x80-\xFF]{1,255}\Z(?!\n)/, where
 255 is measured in bytes (MySQL VARCHAR(255) measures in characters.)
-This works
+Tag names must be valid UTF-8. This works
 with both UTF-8 and Latin-1 accented characters, and it also works with
 MySQL's fulltext parser (which treats >=0x80 characters as part of the word,
 try with U+00F7). Tag names are case-insensitive and accent-insensitive,

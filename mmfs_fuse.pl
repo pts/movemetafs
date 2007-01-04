@@ -74,6 +74,12 @@ sub mknod($$$) {
   syscall(SYS_mknod(), $fn, $mode, $rdev); # Imp: 64-bit
 }
 
+sub verify_utf8($) {
+  my($S)=@_;
+  die "bad UTF-8 string\n" if $S!~/\A(?:[\000-\177]+|[\xC0-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF7][\x80-\xBF]{3})*\Z(?!\n)/;
+  undef
+}
+
 # --- Configuration functions
 
 my %config;
@@ -117,16 +123,85 @@ my $all_fs=config_get('all.fs',''); # !!
 #** @return :DBI::db
 sub db_connect() {
   if (!ref $dbh) {
+    # vvv Dat: needs MySQL (dbi:mysql:..., cpan DBD::mysql)
     $dbh=DBI->connect(
       config_get('db.dsn'), config_get('db.username'), config_get('db.auth'),
       { #defined $attrs{RootClass} ? ( RootClass => $attrs{RootClass} ) : (),
-        RaiseError=>1, PrintError=>0, AutoCommit=>0 });
+        RaiseError=>1, PrintError=>0, AutoCommit=>1 });
     die if !ref $dbh; # Dat: not reached, error already raised
+    die unless $dbh->do(q(SET NAMES 'utf8' COLLATE 'utf8_general_ci'));
+    my $N=1;
+    my $sql;
+    while (defined($sql=config_get("db.onconnect.$N"))) {
+      die unless $dbh->do($sql);
+      $N++
+    }
   }
   $dbh
 }
 
-die "".db_connect();
+
+#** Dat: it is not necessary to call $sth->finish() after all rows have been
+#**      fetched
+#** @param rest-@_ @bind_params
+#sub DBI::db::query {
+#  my($dbh_self,$sql)=splice(@_,0,2);
+sub db_query {
+  my($sql)=shift; my $dbh_self=($dbh or db_connect());
+  my $sth=$dbh_self->prepare_cached($sql,undef,1); # Imp: 3 is safer than 1 -- do we need it?
+  $sth->execute(@_);
+  $sth
+}
+
+sub verify_tag($) {
+  my($tag)=@_;
+  die "bad tag\n" if $tag!~/\A[0-9a-zA-Z_\x80-\xFF]{1,255}\Z(?!\n)/;
+  verify_utf8($tag);
+  undef
+}
+
+#** See mysql/mysqld_ername.h
+sub ER_DUP_ENTRY() { 1062 }
+
+sub insert_tag($) {
+  my($tag)=@_;
+  verify_tag($tag);
+  #my $rv=db_connect()->do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'') ON DUPLICATE KEY UPDATE tag=?", undef, $tag, $tag) };
+  # Dat: $rv==1: inserted, $rv==2: updated. Where is this documented?
+  eval { db_connect()->do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'')", undef, $tag) };
+  die "tag already exists\n" if $@ and $dbh->err==ER_DUP_ENTRY;
+  die $@ if $@;
+  undef
+}
+
+sub delete_tag($) {
+  my($tag)=@_;
+  verify_tag($tag);
+  db_connect()->begin_work();
+  my $sth=db_query("SELECT 1 FROM tags WHERE tag=? AND fs<>'' LIMIT 1",$tag);
+  if ($sth->fetchrow_array()) {
+    $sth->finish();
+    db->rollback();
+    die "tag is in use\n";
+  }
+  $sth->finish();
+  my $num_rows=0+db_connect()->do("DELETE FROM tags WHERE tag=?", undef, $tag);
+  $dbh->commit();
+  die "tag not found\n" if !$num_rows;
+  #die "tag already exists" if $dbh->err==ER_DUP_ENTRY;
+  #die $@ if $@;
+  undef
+}
+
+my $sth=db_query("SHOW TABLES");
+my $ar;
+while ($ar=$sth->fetchrow_arrayref()) { print "@$ar.\n" }
+print "qdone\n";
+$sth=db_query("SHOW TABLES");
+while ($ar=$sth->fetchrow_arrayref()) { print "@$ar.\n" }
+print "qdone\n";
+insert_tag("vacation");
+delete_tag("vacation");
 
 #** @param $_[0] shortname
 sub shorten_with_ext_bang($) {
@@ -646,7 +721,7 @@ sub my_listxattr($) {
     elsif ($ARGV[$I] eq '--quiet'  ) { $DEBUG-- }
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
-    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.1 2007-01-04 19:49:40 pts Exp $'."\n"; exit 0 }
+    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.2 2007-01-04 20:32:00 pts Exp $'."\n"; exit 0 }
     else { die "$0: unknown option: $ARGV[$I]\n" }
   }
   splice @ARGV, 0, $I;
