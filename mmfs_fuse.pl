@@ -44,6 +44,7 @@
 # Dat: FUSE always calls GETATTR first, so open() usually doesn't report
 #      Errno::ENOENT, because GETATTR has already done it.
 # Dat: we use UTF-8 Perl strings, not Unicode ones (the utf8 flag is off)
+# Dat: both , and AND are good for SQL UPDATE ... SET ...
 #
 package MMFS;
 use Cwd;
@@ -176,7 +177,7 @@ sub ER_DUP_ENTRY() { 1062 }
 
 sub db_transaction($) {
   my($sub)=@_;
-  die "already in transaction\n" if db_connect()->{AutoCommit};
+  die "already in transaction\n" if !db_connect()->{AutoCommit};
   $dbh->begin_work();
   my $ret=eval { $sub->() }; # Imp: wantarray()
   if ($@) {
@@ -265,30 +266,51 @@ sub db_tags() {
 sub shorten_with_ext_bang($) {
   my $ext=''; $ext=$1 if $_[0]=~s@([.][^.]{1,15})\Z(?!\n)@@;
   die if length($ext)>16;
-  substr($_[0],255-length($ext))='';
+  substr($_[0],255-length($ext))='' if length($_[0])>255-length($ext);
   $_[0].=$ext;
   undef
 }
 
 #** @return :Boolean
-sub db_have_other_shortname($$$) {
-  my($shortprincipal,$fs,$ino)=@_;
-  # vvv Imp: faster than COUNT(*)?
-  my $L=db_query_all(
-    "SELECT COUNT(*) FROM files WHERE shortprincipal=? AND (ino<>? OR fs<>?)",
-    $shortprincipal, $ino,$fs);
-  $L->[0][0]
-}
+#sub db_have_other_shortprincipal($$$) {
+##  my($shortprincipal,$fs,$ino)=@_;
+#  # vvv Imp: faster than COUNT(*)?
+#  my $L=db_query_all(
+#    "SELECT COUNT(*) FROM files WHERE shortprincipal=? AND (ino<>? OR fs<>?)",
+#    $shortprincipal, $ino,$fs);
+#  $L->[0][0]
+#}
 
 #** @return ($shortprincipal,$shortname) :Strings
-sub gen_shorts($$$) {
+sub db_gen_shorts($$$) {
   my($principal,$fs,$ino)=@_;
-  my $shortname=$principal;
-  $shortname=~s@\A.*/@@s;
-  shorten_with_ext_bang($shortname);
-  my $shortprincipal=$shortname;
-  if ($shortname=~m@\A:[0-9a-f]+:@ or
-      db_have_other_shortprincipal($shortprincipal,$fs,$ino)) {
+  my $shortprincipal=$principal;
+  $shortprincipal=~s@\A.*/@@s;
+  shorten_with_ext_bang($shortprincipal);
+  my $shortname=$shortprincipal;
+
+  my $use_longer_p=($shortprincipal=~m@\A:[0-9a-f]+:@) ? 1 : 0;
+  my $sth=db_query("SELECT fs, ino, shortname FROM files WHERE shortprincipal=? AND NOT (ino=? AND fs=?)",
+    $shortprincipal, $ino, $fs);
+  my($fs1,$ino1,$shortname0);
+  my @sql_updates;
+  while (($fs1,$ino1,$shortname0)=$sth->fetchrow_array()) {
+    my $shortname1=$shortprincipal;
+    $use_longer_p=1;
+    print STDERR "SIMILAR SHORTNAME $fs1 $ino1 $shortname1.\n" if $DEBUG;
+    my $prepend1=sprintf(":%x:%s:",$ino1,$fs1);
+    die if length($prepend1)>127;
+    substr($shortname1,0,0)=$prepend1; # Dat: not largefile-safe
+    shorten_with_ext_bang($shortname1);
+    print STDERR "SIMILAR SHORTNAME CHANGING TO $shortname1.\n" if $DEBUG;
+    push @sql_updates, ["UPDATE files SET shortname=? WHERE ino=? AND fs=?",
+      $shortname1, $ino1, $fs1] if $shortname1 ne $shortname0;
+  }
+  undef $sth;
+  # vvv Imp: enter transaction if not already in one (we're in one!)
+  for my $sql (@sql_updates) { &db_do(@$sql) }
+  # $dbh->commit(); die "ZZ";
+  if ($use_longer_p) {
     my $prepend=sprintf(":%x:%s:",$ino,$fs);
     die if length($prepend)>127;
     substr($shortname,0,0)=$prepend; # Dat: not largefile-safe
@@ -314,29 +336,50 @@ sub file_principal_to_fs_ino($) {
   ($all_fs,$st[1]) # Imp: better than $all_fs
 }
 
-#** Ensures that table files contains $principal. !! Searches by ($fs,$ino).
+#** Ensures that table files contains $principal. Searches by ($fs,$ino).
 sub db_ensure_principal($;$$) {
   my($principal,$fs,$ino)=@_;
   db_transaction(sub {
-    if (0==$dbh->query_all("SELECT COUNT(*) FROM files WHERE principal=?", $principal)->[0][0]) {
+    ($fs,$ino)=file_principal_to_fs_ino($principal) if !defined$ino; # Dat: this might die()
+    # vvv Imp: is COUNT(*) or LIMIT 1 faster?
+    if (0==db_query_all("SELECT COUNT(*) FROM files WHERE ino=? AND fs=?", $ino, $fs)->[0][0]) {
       # Dat: with transactions, this ensures that the same $principal is not inserted twice (really?? !! test it)
-      ($fs,$ino)=file_principal_to_fs_ino($principal) if !defined$ino; # Dat: this might die()
-      my ($shortprincipal,$shortname)=gen_shorts($principal,$fs,$ino);
-      db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?)",
-        $principal, $shortname, $shortprincipal, $ino, $fs); # Dat: this shouldn't throw
+      my($shortprincipal,$shortname)=db_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
+      db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?,?)",
+        $principal, $shortname, $shortprincipal, $ino, $fs); # Dat: this shouldn't die()
     }
   });
 }
 
 #** Changes files.principal of $real to $real
-sub db_rename_principal($) {
-  my($fn)=@_;
+sub db_rename_fn($$) {
+  my($oldfn,$fn)=@_;
   my $principal=$fn;
   die "not a mirrored filename\n" if $principal!~s@\A/root/+@@;
+  my $shortprincipal=$principal;
+  $shortprincipal=~s@\A.*/@@s;
+  shorten_with_ext_bang($shortprincipal);
   my($fs,$ino)=file_principal_to_fs_ino($principal); # Dat: this might die()
-  my $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
-    $principal, $ino, $fs); # Dat: might have no effect
-  print STDERR "RENAME_PRINCIPAL principal=($principal) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+  my $oldprincipal=$oldfn;
+  die "not a mirrored filename\n" if $oldprincipal!~s@\A/root/+@@;
+  my $oldshortprincipal=$oldprincipal;
+  $oldshortprincipal=~s@\A.*/@@s;
+  shorten_with_ext_bang($oldshortprincipal);
+  my $rv;
+  if ($oldshortprincipal eq $shortprincipal) { # Dat: shortcut: last filename component doesn't change
+    print STDERR "RENAME_PRINCIPAL QUICK principal=($principal) ino=$ino fs=($fs)\n" if $DEBUG;
+    $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
+      $principal, $ino, $fs); # Dat: might have no effect
+    print STDERR "RENAME_PRINCIPAL QUICK principal=($principal) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+  } else {
+    db_transaction(sub {
+      print STDERR "RENAME_PRINCIPAL principal=($principal) ino=$ino fs=($fs)\n" if $DEBUG;
+      my($shortprincipal,$shortname)=db_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
+      $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
+        $principal, $shortprincipal, $shortname, $ino, $fs); # Dat: might have no effect
+      print STDERR "RENAME_PRINCIPAL principal=($principal) shortprincipal=($shortprincipal) shortname=($shortname) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+    });
+  }
   $rv
 }
 
@@ -347,7 +390,7 @@ sub db_add_tag($$) {
   print STDERR "DB_ADD_TAG principal=($principal) tag=($tag)\n" if $DEBUG;
   my($fs,$ino)=file_principal_to_fs_ino($principal); # Dat: this might die()
   print STDERR "DB_ADD_TAG principal=($principal) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
-  
+  db_ensure_principal($principal,$fs,$ino);
 }
 
 #die $dbh->{AutoCommit};
@@ -745,7 +788,7 @@ sub my_rename($$) {
   print STDERR "RENAME($oldfn,$fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/tag/([^/]+)/[^/]+\Z(?!\n)@ and defined(sub_to_real($oldfn))) {
-      # !! move from "/tag/$tag/$shortprincipal" etc. (automatic?)
+      # !! move from "/tag/$tag/$shortprincipal" etc. (automatic?), other places too
       my $tag=$1;
       eval { db_add_tag($oldfn,$tag) };
       return diemsg_to_nerrno()
@@ -756,7 +799,7 @@ sub my_rename($$) {
   } elsif (!rename($oldreal,$real)) {
     return -1*$!
   } else {
-    eval { db_rename_principal($fn) };
+    eval { db_rename_fn($oldfn,$fn) };
     return diemsg_to_nerrno()
   }
 }
@@ -885,7 +928,7 @@ sub my_listxattr($) {
     elsif ($ARGV[$I] eq '--quiet'  ) { $DEBUG-- }
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
-    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.3 2007-01-04 22:55:01 pts Exp $'."\n"; exit 0 }
+    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.4 2007-01-04 23:48:16 pts Exp $'."\n"; exit 0 }
     else { die "$0: unknown option: $ARGV[$I]\n" }
   }
   splice @ARGV, 0, $I;

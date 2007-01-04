@@ -74,6 +74,7 @@ Current limitations:
 -- POSIX extended attributes and ACLs are not mirrorred
 -- searching is faster than tagging and untagging
 -- tags cannot be multiple levels deep (i.e. contain `/')
+-- no `$TAGNAME1 OR $TAGNAME2' searches
 
 Requirements (install them in this order):
 
@@ -286,13 +287,36 @@ Search query strings
 ~~~~~~~~~~~~~~~~~~~~
 A search query string is a specification about tags. All files are returned
 whose tags match the specification. For simple searches, files are returned
-in decreasing order of relevance (not important since 
+in decreasing order of relevance (not very important since most file
+managers and ls(1) reorder the list).
 
-MySQL fulltext search is used to 
+MySQL fulltext search is used to find tags:
 
-!! write this
+-- SELECT fs, ino WHERE MATCH(tags) AGAINST('$QUERYSTRING');
+   This is used if $QUERYSTRING doesn't contain ASCII puctuation characters.
 
+-- SELECT fs, ino WHERE MATCH(tags) AGAINST('$QUERYSTRING' IN BOOLEAN MODE);
+   This is used if $QUERYSTRING contains ASCII puctuation characters.
+   Please note that relevance is not much intuitive in boolean mode.
 
+Read more about specifying MySQL fulltext search queries on
+http://dev.mysql.com/doc/mysql/en/fulltext-search.html .
+
+Please note that minimum word length can be assumed to be 1, and there are
+no stop words. This is accomplished by the following transformation on
+the words of `tags':
+
+-- `qqa' is appended to 1-character words 
+-- `qb'  is appended to 2-character words
+-- `k'   is appended to 3-character words
+-- 'q'   is appended to words longer than 3 characters
+
+There is no point quoting multiple words in `"' in the query string, because
+the word order in `tags' is undefined.
+
+MySQL fulltext search supports only the _and_ logic operation (i.e. it
+doesn't support _or_), so it is not possible to search for all files having
+tag A or B in one query string.
 
 Design decisions
 ~~~~~~~~~~~~~~~~
@@ -301,6 +325,7 @@ Search results (search/$QUERYSTRING/*) are symlinks.
 
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
+!! implement the spec
 !! easy: keep a tag even if no files are associated with it: empty .fs
 !! try: case insensitive tags
 !! doc: no built-in way to search for files matching `A or B'
@@ -366,5 +391,11 @@ Improvement possibilites
 !! feature: test mysql_auto_reconnect
 !! examine: why are there so many GETATTR() etc. calls?
    How to cache? Which file manager to use?
+!! feature: add relevance value to symlink names for sort() in ls(1)
+!! feature: update (shorten) shortname when removing or moving away files
+   with the same shortprincipal
+!! cleanup: add `if $DEBUG'
+!! feature: referential integrity (or cleanup): remove stale entries from
+   `files'
 
 __END__
