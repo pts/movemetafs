@@ -105,7 +105,7 @@ Installation quickstart
 2. Install the requirements (see above).
 3. Mount your carrier filesystem on which you want to have metadata on.
 4. Copy the mmfs_fuse.pl executable to your path.
-5. Create the MySQL database.
+5. Create the MySQL database (with recreate.sql).
 6. Start mmfs_fuse.pl with the appropriate arguments, which will mount your
    filesystem with a new mount point.
 
@@ -228,23 +228,22 @@ Besides meta/root, there are also some special folders in meta/, which
 behave quite differently from regular filesystems:
 
 -- Permissions and ownerships don't matter.
--- meta/search
-   -- meta/search appears to be an empty folder.
-   -- meta/search and its contents are not writable.
-   -- Listing (the invisible) meta/search/$QUERYSTRING will (re)run the search
-      query specified in $QUERYSTRING, and list all resulting files as
-      symlinks to the principal name of the file inside meta/root. See
-      the section ``Search query strings'' for more information about query
-      string syntax and the order of the files returned.
 -- meta/tag
    -- meta/tag and its contents are not writable except for the
       operations listed below.
    -- Listing meta/tag yields all of the tags known by the system, as a
       directory.
    -- Listing `meta/tag/$TAGNAME' is equivalent to listing
-      `meta/search/$TAGNAME', i.e. it lists all files having that tag.
-   -- Creating a new directory in `meta/tag' adds a tag by that name to the
-      system (and returns EINVAL if the tag name is invalid).
+      `meta/search/$TAGNAME' except for the relevance order,
+      i.e. it lists all files having that tag.
+   -- Creating a new directory in `meta/tag' creates a tag by that name to the
+      system. Please note
+      it is an error (Invalid argument) to add a non-UTF-8 tag name. Since
+      tag names are case-insensitive and accent-insensitive, it is not
+      possible (File exists) to add a tag `BaR' after `bar' has been added.
+   -- Renaming a directory in `meta/tag/' renames the specified tag. This
+      operation is quite slow: its speed is proportional to the number of
+      files having that tag.
    -- Removing a directory in `meta/tag/' removes the specified tag from the
       system. This is not possible if there are files tagged with it.
    -- Moving a file from `root/...' (or `meta/tag/' or `meta/untag/'
@@ -253,8 +252,12 @@ behave quite differently from regular filesystems:
       and the file is _not_ removed from its original place (and its old
       tags are not changed either).
    -- It is not possible to add a tag to a file if the `meta/tag/$TAGNAME'
-      directory doesn't exists (error: ENOENT). This is for protecting
+      directory doesn't exist (error: ENOENT). This is for protecting
       against typos.
+   -- It is not possible to copy files into `meta/tag/' or create files
+      there.
+   -- Removing `meta/tag/$TAGNAME/$SHORTNAME' removes $TAGNAME from the
+      file specified in $SHORTNAME.
 -- meta/untag
    -- meta/untag behaves exactly like meta/tag, except when files are moved
       to `meta/untag/$TAGNAME', and except for `meta/tag/:all'.
@@ -263,21 +266,44 @@ behave quite differently from regular filesystems:
    -- Listing meta/untag yields all of the tags known by the system, as a
       directory.
    -- Listing `meta/untag/$TAGNAME' is equivalent to listing
-      `meta/search/$TAGNAME', i.e. it lists all files having that tag.
+      `meta/search/$TAGNAME' except for the relevance order,
+      i.e. it lists all files having that tag.
    -- Creating a new directory in `meta/untag' adds a tag by that name to the
-      system (and returns EINVAL if the tag name is invalid).
+      system. Please note
+      it is an error (Invalid argument) to add a non-UTF-8 tag name. Since
+      tag names are case-insensitive and accent-insensitive, it is not
+      possible (File exists) to add a tag `BaR' after `bar' has been added.
+   -- Renaming a directory in `meta/untag/' renames the specified tag. This
+      operation is quite slow: its speed is proportional to the number of
+      files having that tag.
    -- Removing a directory in `meta/untag/' removes the specified tag from the
       system. This is not possible if there are files tagged with it.
    -- Moving a file from `root/...' (or `meta/tag/' or `meta/untag/'
       or `meta/search/' etc.) to
-      `meta/untag/$TAGNAME' removes the tag named $TAGNAME to the specific
+      `meta/untag/$TAGNAME' removes the tag named $TAGNAME from the
       file, and the file is _not_ removed from its original place (and its old
       tags are not changed either). If all tags are removed from a file,
       the file is removed from the metadata store, and its principal name,
       checksums etc. are lost. Tags can be added at any later time.
+   -- Removing `meta/untag/$TAGNAME/$SHORTNAME' removes $TAGNAME from the
+      file specified in $SHORTNAME.
+   -- It is not possible to copy files into `meta/untag/' or create files
+      there.
    -- The tag is not removed, even if all files are removed from it.
-   -- The folder `root/untag/:all' appears to be an empty folder. When moving a file to
-      this folder, all tags are removed from the file.
+   -- The folder `meta/untag/:all' appears to be an empty folder. When
+      moving a file to this folder, all tags are removed from the file.
+   -- Listing the folder `meta/untag/:all' yields all files known to
+      movemetafs as symlinks.
+   -- Removing `meta/untag/:all/$SHORTNAME' removes all tags from the
+      file specified in $SHORTNAME.
+-- meta/search
+   -- meta/search appears to be an empty folder.
+   -- meta/search and its contents are not writable.
+   -- Listing (the invisible) meta/search/$QUERYSTRING will (re)run the search
+      query specified in $QUERYSTRING, and list all resulting files as
+      symlinks to the principal name of the file inside meta/root. See
+      the section ``Search query strings'' for more information about query
+      string syntax and the order of the files returned.
 
 To search for files having a single tag only, you can use either
 `meta/tag/$TAGNAME' or `meta/search/$TAGNAME'. To search for files having
@@ -397,5 +423,11 @@ Improvement possibilites
 !! cleanup: add `if $DEBUG'
 !! feature: referential integrity (or cleanup): remove stale entries from
    `files'
+!! feature: renaming tags with smart changes to table taggings
+!! examine: why do I get `mv: overwrite ...?' for the 2nd time if I issue
+   this twice, within 1 second?
+   mv /tmp/mp/root/proba/sub/one /tmp/mp/untag/foo
+   This seems to be a FUSE bug...
+   
 
 __END__
