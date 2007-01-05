@@ -247,6 +247,9 @@ sub db_delete_tag($) {
 
 sub db_have_tag($) {
   my($tag)=@_;
+  return 0 if $tag=~/\s\Z(?!\n)/;
+  # ^^^ Dat: MySQL utf8_general_ci thinks 'foo'='foo ', but we don't want to
+  #     find tags with spaces at the end
   print STDERR "DB_HAVE_TAG($tag)\n";
   # Imp: is COUNT(*) faster?
   my $sth=db_query("SELECT 1 FROM tags WHERE tag=? LIMIT 1",$tag);
@@ -483,7 +486,16 @@ sub db_get_shortnames() {
   map { $_->[0] } @{db_query_all("SELECT shortname FROM files")}
 }
 
+# vvv Dat: double space would be needed for REPLACE(tagtxt,' foo ',' bar '),
+#     but ' foo ' is not twice part of tagtxt anyway
 my $db_concat_tags_sqlpart="CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) ORDER BY tag SEPARATOR ' '),' ')";
+
+#** See also $db_concat_tags_sqlpart
+sub tag_to_tagq($) {
+  my($tag)=@_;
+  $tag.(length($tag)<4 ? (length($tag)<3 ? (length($tag)<2 ? 'qqa' : 'qb') :
+    'k') : 'q')
+}  
 
 #** Dat: this might be sloow
 sub db_repair_taggings() {
@@ -496,14 +508,10 @@ sub db_repair_taggings() {
     # vvv Dat: this is quite fast on 10000 rows
     # vvv Dat: good, doesn't insert empty `tags'
     # !! this makes mysqld crash??
-    #my $rv=db_do("INSERT INTO taggings (fs, ino, tags)
-    #  SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
-    #  WHERE fs<>'' GROUP BY ino, fs
-    #  ON DUPLICATE KEY UPDATE tags=VALUES(tags)");
-    my $rv=db_do("INSERT INTO taggings (fs, ino, tags)
+    my $rv=db_do("INSERT INTO taggings (fs, ino, tagtxt)
       SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
       WHERE fs<>'' GROUP BY ino, fs
-      ON DUPLICATE KEY UPDATE tags=VALUES(tags)");
+      ON DUPLICATE KEY UPDATE tagtxt=VALUES(tagtxt)");
     print STDERR "DB_REPAIR_TAGGINGS affected=$rv\n" if $DEBUG;
   });
 }
@@ -523,20 +531,46 @@ sub db_update_taggings_for($$) {
   # vvv Dat: no serious need of transaction on `taggings')
   print STDERR "DB_UPDATE_TAGGINGS ino=$ino fs=($fs)\n" if $DEBUG;
   db_transaction(sub {
-    db_do("SET SESSION group_concat_max_len = $db_big_31bit");
     my $rv="none";
     if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=?", $ino, $fs)}) {
       # ^^^ Dat: if SELECT below returns empty resultset? -> nothing is inserted
       db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
     } else {
-      $rv=db_do("INSERT INTO taggings (fs, ino, tags)
+      db_do("SET SESSION group_concat_max_len = $db_big_31bit");
+      $rv=db_do("INSERT INTO taggings (fs, ino, tagtxt)
         SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
         WHERE ino=? AND fs=? GROUP by ino, fs
-        ON DUPLICATE KEY UPDATE tags=VALUES(tags)", $ino, $fs);
+        ON DUPLICATE KEY UPDATE tagtxt=VALUES(tagtxt)", $ino, $fs);
     }
-    # db_do("DELETE FROM taggings WHERE ino=? AND fs=? AND CHAR_LENGTH(tags)<3", $ino, $fs);
     print STDERR "DB_UPDATE_TAGGINGS affected=$rv\n" if $DEBUG;
   }, 1);
+}
+
+sub db_rename_tag($$) {
+  my($oldtag,$newtag)=@_;
+  # vvv Dat: this is for GNU mv(1) for `mv meta/tag/old "meta/tag/existing "'
+  $newtag=~s@\A\s+@@;  $newtag=~s@\s+\Z(?!\n)@@;
+  verify_tag($oldtag);
+  verify_tag($newtag);
+  # vvv Dat: Linux rename(2) succeeds for $oldfn eq $newfn, so do we.
+  return if $oldtag eq $newtag;
+  db_transaction(sub {
+    # vvv Dat: this doesn't work if a file has both $newtag, $oldtag
+    # vvv Dat: `IGNORE' prevents the update when a duplicate key constraint
+    #     is violated
+    my $rv=db_do("UPDATE IGNORE tags SET tag=? WHERE tag=?", $newtag, $oldtag);
+    db_do("DELETE FROM tags WHERE tag=?", $oldtag);
+    print STDERR "DB_RENAME_TAG oldtag=($oldtag) newtag=($newtag) affected=($rv)\n";
+    if ($rv) {
+      my $oldtagq=tag_to_tagq($oldtag);
+      my $newtagq=tag_to_tagq($newtag);
+      # vvv Dat: need not be in a transaction with the UPDATE above, table
+      #     `taggings' is not transactional
+      # vvv Imp: maybe regenerate all affected lines in taggings
+      db_do("UPDATE taggings SET tagtxt=REPLACE(REPLACE(tagtxt,?,' '),?,?) WHERE MATCH(tagtxt) AGAINST (?)",
+        " $newtagq ", " $oldtagq ", " $newtagq ", $oldtagq);
+    }
+  });
 }
 
 #die $dbh->{AutoCommit};
@@ -951,11 +985,17 @@ sub my_rename($$) {
   print STDERR "RENAME($oldfn,$fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(tag|untag)/([^/]+)/[^/]+\Z(?!\n)@ and defined(sub_to_real($oldfn))) {
+      my $op=$1; my $tag=$2;
       # !! move from "/tag/$tag/$shortprincipal" etc. (automatic?), other places too
-      my $op=$1;
-      my $tag=$2;
       eval { $op eq 'tag' ? db_op_tag($oldfn,$tag) : db_op_untag($oldfn,$tag) };
       return diemsg_to_nerrno()
+    } elsif ($fn=~m@/(tag|untag)/([^/]+)\Z(?!\n)@) {
+      my $op=$1; my $tag=$2;
+      if ($oldfn=~m@/(tag|untag)/([^/]+)\Z(?!\n)@) {
+        my $oldop=$1; my $oldtag=$2;
+        eval { db_rename_tag($oldtag,$tag) };
+        return diemsg_to_nerrno()
+      }
     }
     return -1*Errno::EPERM
   } elsif (!defined($oldreal=sub_to_real($oldfn))) {
@@ -1099,7 +1139,7 @@ sub my_listxattr($) {
     elsif ($ARGV[$I] eq '--quiet'  ) { $DEBUG-- }
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
-    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.7 2007-01-05 12:39:58 pts Exp $'."\n"; exit 0 }
+    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.8 2007-01-05 19:40:44 pts Exp $'."\n"; exit 0 }
     else { die "$0: unknown option: $ARGV[$I]\n" }
   }
   splice @ARGV, 0, $I;

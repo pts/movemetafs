@@ -260,6 +260,15 @@ behave quite differently from regular filesystems:
       there.
    -- Removing `meta/tag/$TAGNAME/$SHORTNAME' removes $TAGNAME from the
       file specified in $SHORTNAME.
+   -- Renaming `meta/tag/$OLDTAGNAME' to `meta/tag/$NEWTAGNAME' renames the
+      tag. The amount of time needed is proportional to the number of files
+      the $OLDTAGNAME is associated to. Renaming works with `meta/untag'
+      in place of `meta/tag' both folder names. If $NEWTAGNAME already exists,
+      tags $OLDTAGNAME and $NEWTAGNAME are merged to $NEWTAGNAME. Some
+      utilities such as GNU mv(1) try to be smart and move $OLDTAGNAME inside
+      `meta/tag/$NEWTAGNAME' if the latter exists (as a directory). This can
+      be circumvented by adding spaces to the front or end of $NEWTAGNAME,
+      for example `mv meta/tag/old "meta/tag/existing "'.
 -- meta/untag
    -- meta/untag behaves exactly like meta/tag, except when files are moved
       to `meta/untag/$TAGNAME', and except for `meta/tag/:all'.
@@ -298,6 +307,8 @@ behave quite differently from regular filesystems:
       movemetafs as symlinks.
    -- Removing `meta/untag/:all/$SHORTNAME' removes all tags from the
       file specified in $SHORTNAME.
+   -- Renaming `meta/untag/$OLDTAGNAME' to `meta/untag/$NEWTAGNAME' renames
+      the tag. See more about renaming tags under `meta/tag'.
 -- meta/search
    -- meta/search appears to be an empty folder.
    -- meta/search and its contents are not writable.
@@ -514,5 +525,7 @@ Improvement possibilites
    SELECT fs, ino, CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) SEPARATOR ' '),' ') AS co FROM tags WHERE fs<>'' GROUP BY ino, fs HAVING co<>' jaypiczq ';
    INSERT INTO taggings (fs, ino, tags) SELECT fs, ino, CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) ORDER BY tag SEPARATOR ' '),' ') FROM tags WHERE fs<>'' GROUP BY ino, fs ON DUPLICATE KEY UPDATE tags=VALUES(tags);
    SELECT * FROM taggings WHERE MATCH(tags) AGAINST('b\303\241llq');
+!! report GROUP_CONCAT size bug
+!! test: GROUP_CONCAT truncation
    
 __END__
