@@ -349,6 +349,58 @@ Design decisions
 Search results (search/$QUERYSTRING/*) are symlinks.
 !!
 
+Why did we choose Linux?
+
+-- We like all Unix systems in general, however FUSE doesn't run on many
+   systems: it is stable on Linux, and it is reported to run on FreeBSD.
+   Since we use mostly Linux for everyday work and software development,
+   we test movemetafs mostly on Linux.
+
+Why did we choose MySQL?
+
+-- It is possible to use another RDBMS in general, but we don't have the
+   human resources right now to develop for more than one. The toughest
+   part would be working without the fulltext indexing provided by MySQL.
+
+-- MySQL provides fast fulltext indexes.
+
+-- MySQL is fast. It is generally as fast as PostgreSQL (or a little faster,
+   as some people say), and it is much-much faster than SQLite. We had
+   terrible performance issues with SQLite 3.3.5, partly because it
+   always reopened the database files, partly because it failed to recognize
+   the obviously proper index when executing SELECT queries.
+
+-- MySQL is easy to set up with proper UTF-8 data support. PostgreSQL 8.1
+   isn't (the whole cluster might have to be recreated with initdb(1)).
+   MySQL is even easier to setup using pts-mysql-local.
+
+-- A database with a mixture of UTF-8 strings (tags) and 8-bit binary
+   strings (filenames) work like a charm in MySQL. No extra code is
+   necessary for handling charcter set and collation issues if the schema
+   is properly created, and SET NAMES ... is properly called. This should
+   be the case with SQLite3, but problems might arise with PostgreSQL.
+
+Why did we choose FUSE?
+
+-- FUSE is safe during development (contrary to implementing our own kernel
+   module or modifying e.g. Unionfs).
+
+-- After installation (and kernel module loading), FUSE doesn't need root
+   privileges.
+
+-- FUSE is scriptable in Perl.
+
+Why did we choose Perl?
+
+-- Perl is powerful: it is easy to write simple programs in Perl, and it is
+   not overcomplicated to write complicated programs. Ideal for
+   implementing something from scratch, and also ideal for incremental
+   software development while the specification changes.
+
+-- FUSE is scriptable in Perl.
+
+-- It is easy to add logging facilities to Perl scripts.
+
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
 !! implement the spec
@@ -428,6 +480,8 @@ Improvement possibilites
    this twice, within 1 second?
    mv /tmp/mp/root/proba/sub/one /tmp/mp/untag/foo
    This seems to be a FUSE bug...
-   
+!! feature: file change notification (for SHA1 hashes) with inotify,
+   dnotify, snotify etc.
+!! use Errno::EXDEV: cross device link, improper link
 
 __END__

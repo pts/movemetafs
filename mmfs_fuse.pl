@@ -626,9 +626,10 @@ sub my_getattr($) {
       or db_have_tag($tag);
     $mode=($mode&0644)|S_IFDIR;
   } elsif ($fn=~m@\A/(?:tag|untag)/([^/]+)/([^/]+)\Z(?!\n)@) { # Dat: ls(!) and zsh(1) echo tag/* needs it
+    # Dat: presence of this branch is needed for `echo tag/bar/*'
     # Dat: rm meta/tag/foo/never-existing-file works (unlink() returns 0),
     #      because we are lazy here
-    # Dat: this is needed for `echo tag/bar/*'
+    # Dat: our laziness doesn't prevent mv(1) from moving a file to /tag/foo/
     # Imp: maybe do a SELECT for each tagged file? Would be too slow...
     my $subdir=$1; my $symlink=$2;
     #return -1*Errno::ENOENT if !db_have_tag($subdir); # Dat: checked by the previous call, but could be changed since then...)
@@ -1029,7 +1030,7 @@ sub my_listxattr($) {
     elsif ($ARGV[$I] eq '--quiet'  ) { $DEBUG-- }
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
-    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.5 2007-01-05 01:13:06 pts Exp $'."\n"; exit 0 }
+    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.6 2007-01-05 01:38:04 pts Exp $'."\n"; exit 0 }
     else { die "$0: unknown option: $ARGV[$I]\n" }
   }
   splice @ARGV, 0, $I;
