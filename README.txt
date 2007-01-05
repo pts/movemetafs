@@ -246,11 +246,13 @@ behave quite differently from regular filesystems:
       files having that tag.
    -- Removing a directory in `meta/tag/' removes the specified tag from the
       system. This is not possible if there are files tagged with it.
-   -- Moving a file from `root/...' (or `meta/tag/' or `meta/untag/'
+   -- Moving a file from `meta/root/...' (or `meta/tag/' or `meta/untag/'
       or `meta/search/' etc.) to
       `meta/tag/$TAGNAME' adds the tag named $TAGNAME to the specific file,
       and the file is _not_ removed from its original place (and its old
-      tags are not changed either).
+      tags are not changed either). Moving files from the carrier
+      into `meta/tag/.../' won't ever work -- move files from
+      `meta/root/...' instead.
    -- It is not possible to add a tag to a file if the `meta/tag/$TAGNAME'
       directory doesn't exist (error: ENOENT). This is for protecting
       against typos.
@@ -483,5 +485,22 @@ Improvement possibilites
 !! feature: file change notification (for SHA1 hashes) with inotify,
    dnotify, snotify etc.
 !! use Errno::EXDEV: cross device link, improper link
+!! doc: performance on icy:
+   $ time bash -c 'find -type f -print0 | xargs -0 -i mv {} /tmp/mp/tag/mytag'
+   real    2m48.866s
+   user    0m4.110s
+   sys     0m7.420s
+   $ ls | wc -l
+   7684
+!! doc: when reloading meta/tag/$TAGNAME in Midnight Commander, we get 3
+   calls for each entry:
+   GETATTR(/tag/jaypicz/001560-hr.jpg)
+   READLINK(/tag/jaypicz/001560-hr.jpg)
+   GETATTR(/root/E/pantyhose.z/jaypicz/jo/001560-hr.jpg)
+!! doc: SUXX: how to find processes locking the stale FUSE filesystem?
+!! measure: file transfer speed (once it is opened) Imp: symlink to real
+   file?
+!! measure: database size
+!! feature: load a lot of data
 
 __END__
