@@ -306,6 +306,11 @@ behave quite differently from regular filesystems:
       symlinks to the principal name of the file inside meta/root. See
       the section ``Search query strings'' for more information about query
       string syntax and the order of the files returned.
+-- meta
+   -- If the folder `meta/repair_taggings' is attempted to be created,
+      movemetafs regenerates the `taggings' table from the `tags' table,
+      and the operation returns `No such file or directory' on success.
+   -- All other write operations fail with `Operation not permitted'.
 
 To search for files having a single tag only, you can use either
 `meta/tag/$TAGNAME' or `meta/search/$TAGNAME'. To search for files having
@@ -406,6 +411,7 @@ Why did we choose Perl?
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
 !! implement the spec
+!! configure: ft_max_word_len (global?): now it is 64 -- is it Unicode?
 !! easy: keep a tag even if no files are associated with it: empty .fs
 !! try: case insensitive tags
 !! doc: no built-in way to search for files matching `A or B'
@@ -434,7 +440,7 @@ Improvement possibilites
    crash? No, because MyISAM is not journaling. So we should have a copy of
    the words in a regular InnoDB table, too.
 !! easy: add qw to the end of words shorter than 4 (to avoid
-   ft_min_word_length), and add q to each tag (to avoid stop words)
+   ft_min_word_len), and add q to each tag (to avoid stop words)
 !! easy: only index regular files
 !! easy: verify filesystem boundaries
 !! easy: prevent removal of a multiple-hard-link file using its principal
@@ -502,5 +508,11 @@ Improvement possibilites
    file?
 !! measure: database size
 !! feature: load a lot of data
-
+!! feature: integrate recreate.sql to mmfs_fuse.pl
+!! SET SESSION group_concat_max_len = 2000000000;
+   SUXX: SELECT @@ft_max_word_len; -- ERROR 1193 (HY000): Unknown system variable 'ft_max_word_len'
+   SELECT fs, ino, CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) SEPARATOR ' '),' ') AS co FROM tags WHERE fs<>'' GROUP BY ino, fs HAVING co<>' jaypiczq ';
+   INSERT INTO taggings (fs, ino, tags) SELECT fs, ino, CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) ORDER BY tag SEPARATOR ' '),' ') FROM tags WHERE fs<>'' GROUP BY ino, fs ON DUPLICATE KEY UPDATE tags=VALUES(tags);
+   SELECT * FROM taggings WHERE MATCH(tags) AGAINST('b\303\241llq');
+   
 __END__

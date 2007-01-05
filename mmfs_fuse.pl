@@ -45,6 +45,7 @@
 #      Errno::ENOENT, because GETATTR has already done it.
 # Dat: we use UTF-8 Perl strings, not Unicode ones (the utf8 flag is off)
 # Dat: both , and AND are good for SQL UPDATE ... SET ...
+# Dat: `CREATE TABLE tags_backup AS SELECT * FROM tags;' doesn't copy indexes
 #
 package MMFS;
 use Cwd;
@@ -120,6 +121,12 @@ sub config_get($;$) {
 
 my $dbh;
 
+# !! 10000000  seems to be unstable
+my $db_big_31bit=10000;
+# vvv Dat: too big, malloc() causes abort in MySQL server
+#my $db_big_31bit=2100000000;
+
+
 #** @return :DBI::db
 sub db_connect() {
   if (!ref $dbh) {
@@ -175,16 +182,22 @@ sub db_do {
 #** See mysql/mysqld_ername.h
 sub ER_DUP_ENTRY() { 1062 }
 
-sub db_transaction($) {
-  my($sub)=@_;
-  die "already in transaction\n" if !db_connect()->{AutoCommit};
-  $dbh->begin_work();
-  my $ret=eval { $sub->() }; # Imp: wantarray()
-  if ($@) {
-    $dbh->rollback() if !$dbh->{AutoCommit};
-    die $@;
+#** @param $maybe_p proceed if already inside a transaction
+sub db_transaction($;$) {
+  my($sub,$maybe_p)=@_;
+  my $ret;
+  if (!db_connect()->{AutoCommit}) {
+    die "already in transaction\n" if !$maybe_p;
+    $ret=$sub->();
   } else {
-    $dbh->commit() if !$dbh->{AutoCommit};
+    $dbh->begin_work();
+    $ret=eval { $sub->() }; # Imp: wantarray()
+    if ($@) {
+      $dbh->rollback() if !$dbh->{AutoCommit};
+      die $@;
+    } else {
+      $dbh->commit() if !$dbh->{AutoCommit};
+    }
   }
   $ret
 }
@@ -406,15 +419,10 @@ sub db_op_tag($$) {
   #     because `INSER ... IGNORE' ignores other errors, too
   my $rv=db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
     $ino, $fs, $tag);
+  db_update_taggings_for($fs,$ino) if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
   print STDERR "DB_OP_TAG principal=($principal) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
-  # !! update table taggings
 }
 
-sub db_delete_from_taggings($$$) {
-  my($fs,$ino,$tag)=@_;
-  # !! update table taggings (with qqq-modified words)
-  # !! if $tag eq ':all'
-}
 
 sub db_op_untag($$) {
   my($fn,$tag)=@_;
@@ -430,7 +438,7 @@ sub db_op_untag($$) {
       db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
     print STDERR "DB_OP_UNTAG principal=($principal) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
     if ($rv or $tag eq ':all') { # actiually removed a tag
-      db_delete_from_taggings($fs,$ino,$tag);
+      db_delete_from_taggings_for($fs,$ino,$tag);
       if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
         db_delete_principal($fs,$ino);
       }
@@ -452,7 +460,7 @@ sub db_op_untag_shortname($$) {
         db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
       print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
       if ($rv or $tag eq ':all') { # actiually removed a tag
-        db_delete_from_taggings($fs,$ino,$tag);
+        db_delete_from_taggings_for($fs,$ino,$tag);
         if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
           db_delete_principal($fs,$ino);
         }
@@ -473,6 +481,62 @@ sub db_find_tagged_shortnames($) {
 sub db_get_shortnames() {
   my($tag)=@_;
   map { $_->[0] } @{db_query_all("SELECT shortname FROM files")}
+}
+
+my $db_concat_tags_sqlpart="CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) ORDER BY tag SEPARATOR ' '),' ')";
+
+#** Dat: this might be sloow
+sub db_repair_taggings() {
+  # !! test with long and lot of tags
+  # vvv Dat: no serious need of transaction on `taggings')
+  print STDERR "DB_REPAIR_TAGGINGS\n" if $DEBUG;
+  db_transaction(sub {
+    db_do("DELETE FROM taggings WHERE NOT EXISTS (SELECT * FROM tags WHERE ino=taggings.ino AND fs=taggings.fs)");
+    #db_do("SET SESSION group_concat_max_len = $db_big_31bit"); # !!
+    # vvv Dat: this is quite fast on 10000 rows
+    # vvv Dat: good, doesn't insert empty `tags'
+    # !! this makes mysqld crash??
+    #my $rv=db_do("INSERT INTO taggings (fs, ino, tags)
+    #  SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
+    #  WHERE fs<>'' GROUP BY ino, fs
+    #  ON DUPLICATE KEY UPDATE tags=VALUES(tags)");
+    my $rv=db_do("INSERT INTO taggings (fs, ino, tags)
+      SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
+      WHERE fs<>'' GROUP BY ino, fs
+      ON DUPLICATE KEY UPDATE tags=VALUES(tags)");
+    print STDERR "DB_REPAIR_TAGGINGS affected=$rv\n" if $DEBUG;
+  });
+}
+
+sub db_delete_from_taggings_for($$$) {
+  my($fs,$ino,$tag)=@_;
+  if ($tag eq ':all') {
+    db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
+  } else {
+    db_update_taggings_for($fs,$ino);
+  }
+}
+
+#** Dat: this might be sloow
+sub db_update_taggings_for($$) {
+  my($fs,$ino)=@_;
+  # vvv Dat: no serious need of transaction on `taggings')
+  print STDERR "DB_UPDATE_TAGGINGS ino=$ino fs=($fs)\n" if $DEBUG;
+  db_transaction(sub {
+    db_do("SET SESSION group_concat_max_len = $db_big_31bit");
+    my $rv="none";
+    if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=?", $ino, $fs)}) {
+      # ^^^ Dat: if SELECT below returns empty resultset? -> nothing is inserted
+      db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
+    } else {
+      $rv=db_do("INSERT INTO taggings (fs, ino, tags)
+        SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
+        WHERE ino=? AND fs=? GROUP by ino, fs
+        ON DUPLICATE KEY UPDATE tags=VALUES(tags)", $ino, $fs);
+    }
+    # db_do("DELETE FROM taggings WHERE ino=? AND fs=? AND CHAR_LENGTH(tags)<3", $ino, $fs);
+    print STDERR "DB_UPDATE_TAGGINGS affected=$rv\n" if $DEBUG;
+  }, 1);
 }
 
 #die $dbh->{AutoCommit};
@@ -800,6 +864,11 @@ sub my_mkdir($$) {
       my $tag=$1;
       eval { db_insert_tag($tag); };
       return diemsg_to_nerrno();
+    } elsif ($fn eq '/repair_taggings') {
+      eval { db_repair_taggings(); };
+      return diemsg_to_nerrno();
+      # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
+      #          and return Errno::ENOENT to the application.
     }
     return -1*Errno::EPERM
   } elsif (!mkdir($real,$mode)) {
@@ -1030,7 +1099,7 @@ sub my_listxattr($) {
     elsif ($ARGV[$I] eq '--quiet'  ) { $DEBUG-- }
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
-    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.6 2007-01-05 01:38:04 pts Exp $'."\n"; exit 0 }
+    elsif ($ARGV[$I] eq '--version') { print STDERR __PACKAGE__.' $Id: mmfs_fuse.pl,v 1.7 2007-01-05 12:39:58 pts Exp $'."\n"; exit 0 }
     else { die "$0: unknown option: $ARGV[$I]\n" }
   }
   splice @ARGV, 0, $I;
