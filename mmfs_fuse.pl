@@ -482,7 +482,7 @@ sub mydb_fn_is_principal($) {
 #** @return :String or undef
 sub spec_symlink_get_shortname($) {
   my($fn)=@_;
-  $fn=~m@\A/(?:tag|untag|search)/[^/]+/([^/]+)\Z(?!\n)@ ? $1 : undef
+  $fn=~m@\A/(?:tagged|search)/[^/]+/([^/]+)\Z(?!\n)@ ? $1 : undef
 }
 
 #** @param $fn filename to FUSE handler functions (staring with `/', inside
@@ -578,6 +578,8 @@ sub mydb_op_untag_shortname($$) {
 #** @return :List(String) List of files.shortname (symlink names)
 sub mydb_find_tagged_shortnames($) {
   my($tag)=@_;
+  # Dat: I don't think we should `ORDER BY shortname', the user doesn't care
+  #      anyway.
   map { $_->[0] } @{db_query_all(
     "SELECT shortname FROM tags, files WHERE tags.tag=? AND tags.ino=files.ino AND tags.fs=files.fs",
     $tag)}
@@ -938,26 +940,33 @@ sub my_getattr($) {
   my $blocks=0;
   if ($fn eq '/') {
   # vvv Dat: top level dirs have high priority, because getattr(2) is called for them
-  } elsif ($fn eq '/tag' or $fn eq '/untag' or $fn eq '/search') {
+  } elsif ($fn eq '/tag' or $fn eq '/untag' or $fn eq '/tagged',
+    or $fn eq '/search') {
   } elsif ($fn eq '/root') {
   } elsif (defined($real=sub_to_real($fn))) {
     # Dat: rofs also uses lstat() instead of stat()
     my @L=lstat($real);
     return -1*$! if !@L;
     ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)=@L;
-  } elsif ($fn=~m@\A/(tag|untag)/([^/]+)\Z(?!\n)@) { # Dat: ls(!) and zsh(1) echo tag/* needs it
+  } elsif ($fn=~m@\A/(tag|untag|tagged)/([^/]+)\Z(?!\n)@) { # Dat: ls(!) and zsh(1) echo tag/* needs it
     my $op=$1; my $tag=$2;
-    return -1*Errno::ENOENT unless ($op eq 'untag' and $tag eq ':all')
+    return -1*Errno::ENOENT unless
+      (($op eq 'untag' or $op eq 'tagged') and $tag eq ':all')
       or eval { mydb_have_tag($tag) };
     #$mode=($mode&0755)|S_IFDIR;
   } elsif ($fn=~m@\A/search/([^/]+)\Z(?!\n)@) { # Dat: seems to be needed for my_getdir
     #$mode=($mode&0755)|S_IFDIR;
-  } elsif ($fn=~m@\A/(?:tag|untag|search)/([^/]+)/([^/]*)\Z(?!\n)@ and substr($2,0,2) ne '::') { # Dat: ls(1) and zsh(1) echo tag/* need it
+  } elsif ($fn=~m@\A/(?:tagged|search)/([^/]+)/([^/]*)\Z(?!\n)@ and
+           $2 ne '::') {
+    # Dat: ls(1) and zsh(1) echo tag/* need this
     # Dat: presence of this branch is needed for `echo tag/bar/*'
     # Dat: rm meta/tag/foo/never-existing-file works (unlink() returns 0),
     #      because we are lazy here
     # Dat: our laziness doesn't prevent mv(1) from moving a file to /tag/foo/
-    # Dat: skipping `::' lets us use `mv meta/root/any meta/tag/mytag/:'
+    # Dat: our laziness causes `ls -l meta/tagged/food/blah' report a symlink,
+    #      but readlink(2) returns `No such file or directory'. This is just
+    #      a minor inconvenience that never shows up in graphical file
+    #      managers.
     # Imp: maybe do a SELECT for each tagged file? Would be too slow...
     my $subdir=$1; my $symlink=$2;
     #return -1*Errno::ENOENT if !mydb_have_tag($subdir); # Dat: checked by the previous call, but could be changed since then...)
@@ -978,12 +987,12 @@ sub my_getdir($) {
   print STDERR "GETDIR($dir)\n" if $DEBUG;
   if ($dir eq '/') {
     # Dat: we need '.' and '..' for both / and others
-    return ('.','..','root','search','tag','untag', 0); # $errno
-  } elsif ($dir eq '/tag' or $dir eq '/untag') {
+    return ('.','..','root','search','tag','untag','tagged', 0); # $errno
+  } elsif ($dir eq '/tag' or $dir eq '/untag' or $dir eq '/tagged') {
     my @L=eval { mydb_list_tags() };
     return diemsg_to_nerrno() if $@;
-    return ('.','..',($dir eq '/untag' ? ':all' : ()), @L, 0)
-  } elsif ($dir eq '/untag/:all') {
+    return ('.','..',(($dir eq '/untag' or $dir eq '/tagged') ? ':all' : ()), @L, 0)
+  } elsif ($dir eq '/tagged/:all') {
     my @L=eval { mydb_get_shortnames() };
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
@@ -992,10 +1001,16 @@ sub my_getdir($) {
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
   } elsif ($dir=~m@\A/(?:tag|untag)/([^/]+)\Z(?!\n)@) {
+    # Dat: as of movemetafs-0.04, `meta/tag/$TAGNAME' is empty
+    return ('.','..', 0);
+  } elsif ($dir=~m@\A/(?:tagged)/([^/]+)\Z(?!\n)@) {
     my @L=eval { mydb_find_tagged_shortnames($1) };
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
+  } elsif ($dir eq '/search' or $dir eq '/untag/:all') {
+    return ('.','..',0);
   } elsif (!defined($real=sub_to_real($dir))) {
+    # Dat: getdents64() returns ENOENT, but open(...O_DIRECTORY) succeeds
     return -1*Errno::ENOENT; # Imp: probably ENOTDIR
   } elsif (!opendir($D,$real)) {
     return -1*$!
@@ -1099,7 +1114,7 @@ sub my_unlink($) {
   my $real;
   print STDERR "UNLINK($fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
-    if ($fn=~m@/(?:tag|untag)/([^/]+)/([^/]+)\Z(?!\n)@) {
+    if ($fn=~m@/(?:tagged)/([^/]+)/([^/]+)\Z(?!\n)@) {
       my $tag=$1; my $shortname=$2;
       eval { mydb_op_untag_shortname($shortname,$tag) };
       return diemsg_to_nerrno()
@@ -1121,7 +1136,7 @@ sub my_rmdir($) {
   my $real;
   print STDERR "RMDIR($fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
-    if ($fn=~m@/(?:tag|untag)/([^/]+)\Z(?!\n)@) {
+    if ($fn=~m@/(?:tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
       my $tag=$1;
       eval { mydb_delete_tag($tag); };
       return diemsg_to_nerrno();
@@ -1140,7 +1155,7 @@ sub my_mkdir($$) {
   # Dat: FUSE calls: GETATTR(), MKDIR(), GETATTR()
   print STDERR "MKDIR($fn,$mode)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
-    if ($fn=~m@/(?:tag|untag)/([^/]+)\Z(?!\n)@) {
+    if ($fn=~m@/(?:tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
       my $tag=$1;
       eval { mydb_insert_tag($tag); };
       return diemsg_to_nerrno();
@@ -1230,15 +1245,16 @@ sub my_rename($$) {
   my($oldreal,$real);
   print STDERR "RENAME($oldfn,$fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
-    if ($fn=~m@/(tag|untag)/([^/]+)/[^/]+\Z(?!\n)@) {
+    if ($fn=~m@/(tag|untag|tagged)/([^/]+)/[^/]+\Z(?!\n)@) {
       # Dat: mydb_op_tag() and mydb_op_untag() verify if $oldfn is a mirrored filename,
       #      no need to check defined(sub_to_real($oldfn))
       my $op=$1; my $tag=$2;
+      return -1*Errno::EPERM if $tag eq ':all' and $op ne 'untag';
       eval { $op eq 'tag' ? mydb_op_tag($oldfn,$tag) : mydb_op_untag($oldfn,$tag) };
       return diemsg_to_nerrno()
-    } elsif ($fn=~m@/(tag|untag)/([^/]+)\Z(?!\n)@) {
+    } elsif ($fn=~m@/(tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
       my $op=$1; my $tag=$2;
-      if ($oldfn=~m@/(tag|untag)/([^/]+)\Z(?!\n)@) {
+      if ($oldfn=~m@/(tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
         my $oldop=$1; my $oldtag=$2;
         eval { mydb_rename_tag($oldtag,$tag) };
         return diemsg_to_nerrno()
@@ -1425,7 +1441,7 @@ sub my_removexattr($$) {
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
     elsif ($ARGV[$I] eq '--version') {
-      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.10 2007-01-06 21:32:03 pts Exp $'."\n";
+      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.11 2007-01-06 22:46:05 pts Exp $'."\n";
       print STDERR "by Pe'ter Szabo' since early January 2007\n";
       print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
       exit 0
