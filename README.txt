@@ -1,12 +1,13 @@
 README for movemetafs
-by pts@fazekas.hu at Thu Jan  4 14:48:21 CET 2007
+by pts@fazekas.hu at Sat Jan  6 01:37:45 CET 2007
 
-movemetafs is a searchable filesystem metadata store for Linux, which lets
-users tag local files (including image, video, audio and text files) by
-simply moving the files to a special folder using any file manager, and it
-also lets users find files by tags, using a boolean search query. The
-original files (and their names) are kept intact. movemetafs doesn't have
-its own user interface, but it is usable with any file manager.
+movemetafs is a searchable filesystem metadata store for Linux (with MySQL,
+Perl and FUSE), which lets users tag local files (including image, video,
+audio and text files) by simply moving the files to a special folder using
+any file manager, and it also lets users find files by tags, using a boolean
+search query. The original files (and their names) are kept intact.
+movemetafs doesn't have its own user interface, but it is usable with any
+file manager.
 
 In the name `movemetafs', `metafs' means filesystem metadata store, and
 `move' refers to the most common way tags are added or removed: the user
@@ -21,8 +22,10 @@ movemetafs is similar to LAFS (http://junk.nocrew.org/~stefan/lafs/)
    installation with pts-mysql-local)
 -- movemetafs doesn't require files to be explicitly added
 -- movemetafs cannot list all untagged files quickly
+-- movemetafs is written in Perl, so it is quite easy to extend and try
+   out new features
 
-Features:
+Features of movemetafs:
 
 -- use any file manager to tag (or untag) files: move the file to the
    `meta/tag/$TAGNAME' or `meta/untag/$TAGNAME' folder
@@ -124,10 +127,14 @@ Installation quickstart
    http://freshmeat.net/projects/movemetafs/
 2. Install the requirements (see above).
 3. Mount your carrier filesystem on which you want to have metadata on.
-4. Copy the mmfs_fuse.pl executable to your path.
-5. Create the MySQL database (with recreate.sql).
-6. Start mmfs_fuse.pl with the appropriate arguments, which will mount your
-   filesystem with a new mount point.
+4. (Copy the mmfs_fuse.pl executable to your $PATH.)
+5. Modify your database password in both movemetafs.conf and recreate.sql.
+6. Modify the MySQL database connect string (db.dsn) for your mySQL setup
+   in movemetafs.conf.
+7. Create the MySQL database (with `mysql <recreate.sql').
+8. Start mmfs_fuse.pl with the appropriate arguments, which will mount your
+   filesystem with a new mount point. The config file (movemetafs.conf) is
+   looked for in the current directory.
 
 Basic concepts: carrier and meta filesystems etc.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -615,7 +622,6 @@ Improvement possibilites
 !! think: fulltext index needs MyISAM tables. Do they survive a system
    crash? No, because MyISAM is not journaling. So we should have a copy of
    the words in a regular InnoDB table, too.
-!! easy: verify filesystem boundaries (done, test it)
 !! what if the file os lost? (moved outside movemetafs)
 !! feature: caching of recent shortname -> filename
 !! feature: regenerate cache data
@@ -694,5 +700,6 @@ Improvement possibilites
 !! mv(1) first unlinks target before
    `mv /tmp/mp/tag/bar/\:5d53a\:F\:one /tmp/mp/tag/űrkikötő/',
    but what if we then get an `Operation not permitted'.
+!! easy: --config-file=
 
 __END__
