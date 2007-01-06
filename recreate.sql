@@ -11,17 +11,17 @@ DROP DATABASE movemetafs;
 CREATE DATABASE movemetafs COLLATE 'utf8_general_ci';
 USE movemetafs;
 -- CREATE USER 'movemetafs_ro'@'localhost';
--- SET PASSWORD FOR 'movemetafs_ro'@'localhost' = OLD_PASSWORD('96ftuuNQIrdi9c');  
+-- SET PASSWORD FOR 'movemetafs_ro'@'localhost' = OLD_PASSWORD('put_ro_password_here');  
 -- GRANT Select ON movemetafs.* TO 'movemetafs_ro'@'localhost';
 DELETE FROM mysql.user WHERE user='movemetafs_rw' AND host='localhost';
 INSERT INTO mysql.user (user,host) VALUES ('movemetafs_rw','localhost');
 FLUSH PRIVILEGES;
 -- vvv SUXX: not reentrant because of this CREATE USER 
 -- CREATE USER 'movemetafs_rw'@'localhost';
-SET PASSWORD FOR 'movemetafs_rw'@'localhost' = PASSWORD('5FtHxgE4g8it2');
+SET PASSWORD FOR 'movemetafs_rw'@'localhost' = PASSWORD('put_password_here');
 GRANT Select,Insert,Update,Delete ON movemetafs.* TO 'movemetafs_rw'@'localhost';   
 -- CREATE USER 'movemetafs_full'@'localhost';
--- SET PASSWORD FOR 'movemetafs_full'@'localhost' = PASSWORD('70y3jsMVViYngQ');
+-- SET PASSWORD FOR 'movemetafs_full'@'localhost' = PASSWORD('put_full_password_here');
 -- GRANT ALL ON movemetafs.* TO 'movemetafs_full'@'localhost';
 
 DROP TABLE IF EXISTS files;
@@ -58,6 +58,7 @@ CREATE TABLE taggings (
 ) ENGINE=MyISAM;
 
 -- Dat: each tag has a row here with ino==0 and fs==''
+--      no matter if there are files associated to the tag or not
 DROP TABLE IF EXISTS tags;
 CREATE TABLE tags (
   ino INTEGER UNSIGNED NOT NULL,

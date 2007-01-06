@@ -46,6 +46,9 @@
 # Dat: we use UTF-8 Perl strings, not Unicode ones (the utf8 flag is off)
 # Dat: both , and AND are good for SQL UPDATE ... SET ...
 # Dat: `CREATE TABLE tags_backup AS SELECT * FROM tags;' doesn't copy indexes
+# Dat: policy: my_*() functions don't call db_*(), but only mydb_() directly
+# Dat: policy: we never search `WHERE principal=?' because of files with
+#      multiple hard links
 #
 package MMFS;
 use Cwd;
@@ -56,7 +59,7 @@ use DBI;
 #use DBD::mysql; # Dat: automatic for DBI->connect
 
 use vars qw($VERSION); # Dat: see also CVS ID 
-BEGIN { $VERSION='0.02' }
+BEGIN { $VERSION='0.04' }
 
 use vars qw($DEBUG);
 $DEBUG=1;
@@ -178,7 +181,7 @@ sub db_query_all {
 sub db_do {
   my($sql)=shift; my $dbh_self=($dbh or db_connect());
   my $sth=$dbh_self->prepare_cached($sql,undef,1); # Imp: 3 is safer than 1 -- do we need it?
-  my $rv=$sth->execute(@_);
+  my $rv=$sth->execute(@_); # Imp: caller() on error
   $sth->finish();
   $rv
 }
@@ -206,7 +209,7 @@ sub db_transaction($;$) {
   $ret
 }
 
-# -- movemetafs-specific database routines
+# -- movemetafs-specific database routines (mydb_*())
 
 my $all_fs=config_get('all.fs','F'); # !!
 my $all_dev; # st_dev of "$root_prefix/."
@@ -227,11 +230,12 @@ sub verify_tag_query_string($) {
   die "bad tag query string: bad chars or bad length\n" if
     $tag!~/\A[- +<>()~*"0-9a-zA-Z_\x80-\xFF]{1,255}\Z(?!\n)/; # Dat: $tag_re elsewhere
   die "bad tag query string: only space\n" if $tag!~/\S/;
+  # ^^^ Imp: allow and remove single quotes (?) for mc(1) cd '...'
   verify_utf8($tag);
   undef
 }
 
-sub db_insert_tag($) {
+sub mydb_insert_tag($) {
   my($tag)=@_;
   verify_tag($tag);
   #my $rv=db_do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'') ON DUPLICATE KEY UPDATE tag=?", $tag, $tag) };
@@ -242,7 +246,7 @@ sub db_insert_tag($) {
   undef
 }
 
-sub db_delete_tag($) {
+sub mydb_delete_tag($) {
   my($tag)=@_;
   verify_tag($tag);
   db_connect()->begin_work();
@@ -261,7 +265,7 @@ sub db_delete_tag($) {
   undef
 }
 
-sub db_have_tag($) {
+sub mydb_have_tag($) {
   my($tag)=@_;
   return 0 if $tag=~/\s\Z(?!\n)/;
   # ^^^ Dat: MySQL utf8_general_ci thinks 'foo'='foo ', but we don't want to
@@ -276,13 +280,14 @@ sub db_have_tag($) {
 }
 
 #** @return :List(String) tags
-sub db_tags() {
-  print STDERR "DB_TAGS()\n" if $DEBUG;
+sub mydb_list_tags() {
+  print STDERR "DB_LIST_TAGS()\n" if $DEBUG;
+  # vvv Dat: this would return tags without the fs=''
+  #map { $_->[0] } @{db_query_all(
+  #  "SELECT tag FROM tags GROUP BY tag ORDER BY tag")}
   map { $_->[0] } @{db_query_all(
-    "SELECT tag FROM tags GROUP BY tag ORDER BY tag")}
+    "SELECT tag FROM tags WHERE ino=0 AND fs=''")}
 }
-
-
 
 #my $sth=db_query("SHOW TABLES");
 #my $ar;
@@ -291,8 +296,8 @@ sub db_tags() {
 #$sth=db_query("SHOW TABLES");
 #while ($ar=$sth->fetchrow_arrayref()) { print "@$ar.\n" }
 #print "qdone\n";
-#db_insert_tag("vacation");
-#db_delete_tag("vacation");
+#mydb_insert_tag("vacation");
+#mydb_delete_tag("vacation");
 
 #** @param $_[0] shortname
 sub shorten_with_ext_bang($) {
@@ -314,8 +319,9 @@ sub shorten_with_ext_bang($) {
 #}
 
 #** @return ($shortprincipal,$shortname) :Strings
-sub db_gen_shorts($$$) {
+sub mydb_gen_shorts($$$) {
   my($principal,$fs,$ino)=@_;
+  #if (!defined $ino or $ino=~/\D/) { require Carp; carp("foo") }
   my $shortprincipal=$principal;
   $shortprincipal=~s@\A.*/@@s;
   shorten_with_ext_bang($shortprincipal);
@@ -323,6 +329,7 @@ sub db_gen_shorts($$$) {
 
   my $use_longer_p=($shortprincipal=~m@\A:[0-9a-f]+:@) ? 1 : 0;
   # ^^^ !! is it always correct if our or other shortprincipal starts with m@\A:[0-9a-f]+:@
+  print STDERR "SEARCHING FOR SIMILARS to shortprincipal=($shortprincipal) fs=($fs) ino=$ino.\n" if $DEBUG;
   my $sth=db_query("SELECT fs, ino, shortname FROM files WHERE shortprincipal=? AND NOT (ino=? AND fs=?)",
     $shortprincipal, $ino, $fs);
   my($fs1,$ino1,$shortname0);
@@ -330,8 +337,9 @@ sub db_gen_shorts($$$) {
   while (($fs1,$ino1,$shortname0)=$sth->fetchrow_array()) {
     my $shortname1=$shortprincipal;
     $use_longer_p=1;
-    print STDERR "SIMILAR SHORTNAME $fs1 $ino1 $shortname1.\n" if $DEBUG;
+    print STDERR "SIMILAR SHORTNAME fs=($fs1) ino=$ino1 $shortname1.\n" if $DEBUG;
     my $prepend1=sprintf(":%x:%s:",$ino1,$fs1);
+    ##print STDERR "prepend1=$prepend1\n";
     die if length($prepend1)>127;
     substr($shortname1,0,0)=$prepend1; # Dat: not largefile-safe
     shorten_with_ext_bang($shortname1);
@@ -341,6 +349,7 @@ sub db_gen_shorts($$$) {
   }
   undef $sth;
   # vvv Imp: enter transaction if not already in one (we're in one!)
+  ##print STDERR "SQU=(@sql_updates)\n";
   for my $sql (@sql_updates) { &db_do(@$sql) }
   # $dbh->commit(); die "ZZ";
   if ($use_longer_p) {
@@ -349,6 +358,7 @@ sub db_gen_shorts($$$) {
     substr($shortname,0,0)=$prepend; # Dat: not largefile-safe
     shorten_with_ext_bang($shortname);
   }
+  #print "GEN DONE\n";
   ($shortprincipal,$shortname)
 }
 
@@ -358,72 +368,110 @@ sub db_gen_shorts($$$) {
 #** "$mpoint/root"
 my $root_prefix='';
 
+#** Also verify_principal().
+sub verify_localname($) {
+  my($localname)=@_;
+  die "empty localname\n" if !defined $localname or 0==length($localname);
+  die "bad slashes in localname: $localname\n" if
+    substr($localname,0,1)eq'/' or
+    substr($localname,-1)eq'/' or index($localname,'//')>=0;
+}
+
 #** @return ($fs,$ino)
-sub file_principal_to_fs_ino($) {
-  my($principal)=@_;
+sub file_localname_to_fs_ino($) {
+  my($localname)=@_;
   my @st;
-  die "empty principal\n" if !defined $principal or 0==length($principal);
-  die "principal not found\n" unless @st=lstat($root_prefix.$principal);
-  die "principal not a file\n" if !-f _;
-  die "principal on different filesystem\n" if $st[0] ne $all_dev;
+  die "localname not found\n" unless @st=lstat($root_prefix.$localname);
+  die "localname not a file\n" if !-f _;
+  die "localname on different filesystem\n" if $st[0] ne $all_dev;
   ($all_fs,$st[1]) # Imp: better than $all_fs
 }
 
-#** Ensures that table files contains $principal. Searches by ($fs,$ino).
-sub db_ensure_principal($;$$) {
-  my($principal,$fs,$ino)=@_;
+#** Doesn't do any insert if ($fs,$ino) already exists in `files'.
+#** @in running in a transaction
+sub mydb_insert_fs_ino_principal($$$) {
+  my($fs,$ino,$principal)=@_;
+  # vvv Imp: is COUNT(*) or LIMIT 1 faster?
+  # vvv Dat: we mustn't check for `AND principal=$principal' here, because of
+  #     files with multiple hard links
+  if (0==db_query_all("SELECT COUNT(*) FROM files WHERE ino=? AND fs=?", $ino, $fs)->[0][0]) {
+    # Dat: with transactions, this ensures that the same $principal is not inserted twice (really?? !! test it)
+    my($shortprincipal,$shortname)=mydb_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
+    # !! what if `principal' and `fs--ino' gets out of sync?
+    #    ON DUPLICATE KEY [principal] UPDATE principal=?, shortname=VALUES(shortname), shortprincipal=VALUES(shortprincipal)
+    #print STDERR "INO=$ino\n";
+    db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?,?)",
+      $principal, $shortname, $shortprincipal, $ino, $fs); # Dat: this shouldn't die()
+  }
+}
+
+#** Ensures that table `files' contains $localname. Searches by ($fs,$ino).
+#** If not contains inserts $localname as `files.principal'.
+sub mydb_ensure_fs_ino_name($$$) {
+  my($fs,$ino,$localname)=@_;
+  verify_localname($localname);
   db_transaction(sub {
-    ($fs,$ino)=file_principal_to_fs_ino($principal) if !defined$ino; # Dat: this might die()
-    # vvv Imp: is COUNT(*) or LIMIT 1 faster?
-    if (0==db_query_all("SELECT COUNT(*) FROM files WHERE ino=? AND fs=?", $ino, $fs)->[0][0]) {
-      # Dat: with transactions, this ensures that the same $principal is not inserted twice (really?? !! test it)
-      my($shortprincipal,$shortname)=db_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
-      db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?,?)",
-        $principal, $shortname, $shortprincipal, $ino, $fs); # Dat: this shouldn't die()
-    }
+    ($fs,$ino)=file_localname_to_fs_ino($localname) if !defined$ino; # Dat: this might die()
+    mydb_insert_fs_ino_principal($fs,$ino,$localname);
   },1);
 }
 
-sub db_delete_principal($$) {
+#** Deletes a row from tables `files' if the row doesn't contain useful
+#** information.
+#** @in No tags are associated with the file, tags don't have to be checked.
+sub mydb_delete_from_files_if_no_info($$) {
   my($fs,$ino)=@_;
-  print STDERR "DB_DELETE PRINCIPAL ino=$ino fs=($fs)\n" if $DEBUG;
-  db_do("DELETE FROM files WHERE ino=? AND fs=?", $ino, $fs);
-  # !! shorten files with the same shortprincipal
+  print STDERR "DB_DELETE ino=$ino fs=($fs)\n" if $DEBUG;
+  db_do("DELETE FROM files WHERE ino=? AND fs=? AND descr=''", $ino, $fs);
+  # !! shorten other files with the same shortprincipal
 }
 
-#** Changes files.principal of $real to $real
-sub db_rename_fn($$) {
+#** @in running in a transaction
+sub mydb_delete_from_files_if_no_info_and_tags($$) {
+  my($fs,$ino)=@_;
+  if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+    mydb_delete_from_files_if_no_info($fs,$ino);
+  }
+}
+
+#** Changes files.principal.
+sub mydb_rename_fn($$) {
   my($oldfn,$fn)=@_;
-  my $principal=$fn;
-  die "not a mirrored filename\n" if $principal!~s@\A/root/+@@;
-  my $shortprincipal=$principal;
-  $shortprincipal=~s@\A.*/@@s;
-  shorten_with_ext_bang($shortprincipal);
-  my($fs,$ino)=file_principal_to_fs_ino($principal); # Dat: this might die()
-  my $oldprincipal=$oldfn;
-  die "not a mirrored filename\n" if $oldprincipal!~s@\A/root/+@@;
-  my $oldshortprincipal=$oldprincipal;
+  print STDERR "DB_RENAME_FN oldfn=($fn) fn=($fn)\n" if $DEBUG;
+
+  my $oldlocalname=$oldfn;
+  die "not a mirrored filename\n" if $oldlocalname!~s@\A/root/+@@;
+  my $oldshortprincipal=$oldlocalname;
   $oldshortprincipal=~s@\A.*/@@s;
   shorten_with_ext_bang($oldshortprincipal);
+
+  my $localname=$fn;
+  die "not a mirrored filename\n" if $localname!~s@\A/root/+@@;
+  my $shortprincipal=$localname;
+  $shortprincipal=~s@\A.*/@@s;
+  shorten_with_ext_bang($shortprincipal);
+  my($fs,$ino)=eval { file_localname_to_fs_ino($localname) }; # Dat: this might die()
+  return if $@; # Dat: maybe 'localname not a file' -- must exist, we've just renamed (!! Imp: avoid race condition)
+
   my $rv;
   if ($oldshortprincipal eq $shortprincipal) { # Dat: shortcut: last filename component doesn't change
-    print STDERR "RENAME_PRINCIPAL QUICK principal=($principal) ino=$ino fs=($fs)\n" if $DEBUG;
+    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs)\n" if $DEBUG;
     $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
-      $principal, $ino, $fs); # Dat: might have no effect
-    print STDERR "RENAME_PRINCIPAL QUICK principal=($principal) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+      $localname, $ino, $fs); # Dat: might have no effect
+    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
   } else {
     db_transaction(sub {
-      print STDERR "RENAME_PRINCIPAL principal=($principal) ino=$ino fs=($fs)\n" if $DEBUG;
-      my($shortprincipal,$shortname)=db_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
+      print STDERR "RENAME_FN TO principal=($localname) ino=$ino fs=($fs)\n" if $DEBUG;
+      my($shortprincipal,$shortname)=mydb_gen_shorts($localname,$fs,$ino); # Dat: this modifies the db and it might die()
       $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
-        $principal, $shortprincipal, $shortname, $ino, $fs); # Dat: might have no effect
-      print STDERR "RENAME_PRINCIPAL principal=($principal) shortprincipal=($shortprincipal) shortname=($shortname) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+        $localname, $shortprincipal, $shortname, $ino, $fs); # Dat: might have no effect
+      print STDERR "RENAME_FN TO principal=($localname) shortprincipal=($shortprincipal) shortname=($shortname) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
     });
   }
   $rv
 }
 
-sub db_fn_is_principal($) {
+sub mydb_fn_is_principal($) {
   my($fn)=@_;
   my $principal=$fn;
   die "not a mirrored filename\n" if $principal!~s@\A/root/+@@;
@@ -439,32 +487,36 @@ sub spec_symlink_get_shortname($) {
 
 #** @param $fn filename to FUSE handler functions (staring with `/', inside
 #**   --mount-point=)
-#** @return :String principal or undef
-sub db_fn_to_principal($) {
+#** @return :String localname (principal for `tag/.../...') or undef
+sub mydb_fn_to_localname($) {
   my($fn)=@_;
   return $fn if $fn=~s@\A/root/+@@;
   my $shortname=spec_symlink_get_shortname($fn);
   return undef if !defined $shortname;
   my $L=db_query_all("SELECT principal FROM files WHERE shortname=?",
     $shortname);
-  print STDERR "DB_FN_TO_PRINCIPAL shortname=($shortname) got=$L (@$L).\n" if $DEBUG;
+  print STDERR "DB_FN_TO_LOCALNAME shortname=($shortname) got=$L (@$L).\n" if $DEBUG;
   @$L ? $L->[0][0] : undef
 }
 
 
 #** Dat: no-op if the file already has the tag specified
-sub db_op_tag($$) {
+sub mydb_op_tag($$) {
   my($fn,$tag)=@_;
   die if !defined $tag;
   db_transaction(sub {
-    my $principal=db_fn_to_principal($fn);
-    die "not pointing to a mirrored filename\n" if !defined$principal;
-    print STDERR "DB_OP_TAG principal=($principal) tag=($tag)\n" if $DEBUG;
+    my $localname=mydb_fn_to_localname($fn);
+    die "not pointing to a mirrored filename\n" if !defined$localname;
+    # vvv Dat: this check is superfluous since FUSE has checked with
+    #     GETATTR() anyway, and returned Errno::ENOENT if missing
+    die "unknown tag\n" if !@{db_query_all(
+      "SELECT 1 FROM tags WHERE tag=? AND ino=0 AND fs='' LIMIT 1", $tag)};
+    print STDERR "DB_OP_TAG localname=($localname) tag=($tag)\n" if $DEBUG;
     # Imp: implement file_shortname_to_fs_ino() in addition to
-    #      file_principal_to_fs_ino() to avoid extra database access
-    my($fs,$ino)=file_principal_to_fs_ino($principal); # Dat: this might die()
-    print STDERR "DB_OP_TAG principal=($principal) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
-    db_ensure_principal($principal,$fs,$ino);
+    #      file_localname_to_fs_ino() to avoid extra database access
+    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    print STDERR "DB_OP_TAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
+    mydb_ensure_fs_ino_name($fs,$ino,$localname);
     # vvv Dat: different when row already present
     # vvv Dat: `ON DUPLICATE KEY UPDATE' is better than `REPLACE', because
     #     REPLACE deletes 1st
@@ -472,35 +524,35 @@ sub db_op_tag($$) {
     #     because `INSER ... IGNORE' ignores other errors, too
     my $rv=db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
       $ino, $fs, $tag);
-    db_update_taggings_for($fs,$ino) if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
-    print STDERR "DB_OP_TAG principal=($principal) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
+    mydb_update_taggings_for($fs,$ino) if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
+    print STDERR "DB_OP_TAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
   });
 }
 
 
-sub db_op_untag($$) {
+sub mydb_op_untag($$) {
   my($fn,$tag)=@_;
   die if !defined $tag;
   db_transaction(sub { # Imp: is it faster without a transaction?
-    my $principal=db_fn_to_principal($fn);
-    die "not pointing to a mirrored filename\n" if !defined$principal;
-    print STDERR "DB_OP_UNTAG principal=($principal) tag=($tag)\n" if $DEBUG;
-    my($fs,$ino)=file_principal_to_fs_ino($principal); # Dat: this might die()
-    print STDERR "DB_OP_UNTAG principal=($principal) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
-      my $rv=($tag eq ':all') ?
-        db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
-        db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
-      print STDERR "DB_OP_UNTAG principal=($principal) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
-      if ($rv or $tag eq ':all') { # actiually removed a tag
-        db_delete_from_taggings_for($fs,$ino,$tag);
-        if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
-          db_delete_principal($fs,$ino);
-        }
+    my $localname=mydb_fn_to_localname($fn);
+    die "not pointing to a mirrored filename\n" if !defined$localname;
+    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag)\n" if $DEBUG;
+    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
+    my $rv=($tag eq ':all') ?
+      db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
+      db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
+    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
+    if ($rv or $tag eq ':all') { # actiually removed a tag
+      mydb_delete_from_taggings_for($fs,$ino,$tag);
+      if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+        mydb_delete_from_files_if_no_info($fs,$ino);
       }
-  });
+    }
+  },1);
 }
 
-sub db_op_untag_shortname($$) {
+sub mydb_op_untag_shortname($$) {
   my($shortname,$tag)=@_;
   die if !defined $tag;
   print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag)\n" if $DEBUG;
@@ -514,9 +566,9 @@ sub db_op_untag_shortname($$) {
         db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
       print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
       if ($rv or $tag eq ':all') { # actiually removed a tag
-        db_delete_from_taggings_for($fs,$ino,$tag);
+        mydb_delete_from_taggings_for($fs,$ino,$tag);
         if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
-          db_delete_principal($fs,$ino);
+          mydb_delete_from_files_if_no_info($fs,$ino);
         }
       }
     }
@@ -524,7 +576,7 @@ sub db_op_untag_shortname($$) {
 }
 
 #** @return :List(String) List of files.shortname (symlink names)
-sub db_find_tagged_shortnames($) {
+sub mydb_find_tagged_shortnames($) {
   my($tag)=@_;
   map { $_->[0] } @{db_query_all(
     "SELECT shortname FROM tags, files WHERE tags.tag=? AND tags.ino=files.ino AND tags.fs=files.fs",
@@ -532,16 +584,16 @@ sub db_find_tagged_shortnames($) {
 }
 
 #** @return :List(String) List of files.shortname (symlink names)
-sub db_get_shortnames() {
+sub mydb_get_shortnames() {
   my($tag)=@_;
   map { $_->[0] } @{db_query_all("SELECT shortname FROM files")}
 }
 
 # vvv Dat: double space would be needed for REPLACE(tagtxt,' foo ',' bar '),
 #     but ' foo ' is not twice part of tagtxt anyway
-my $db_concat_tags_sqlpart="CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) ORDER BY tag SEPARATOR ' '),' ')";
+my $mydb_concat_tags_sqlpart="CONCAT(' ',GROUP_CONCAT(CONCAT(tag,IF(CHAR_LENGTH(tag)<4,IF(CHAR_LENGTH(tag)<3,IF(CHAR_LENGTH(tag)<2,'qqa','qb'),'k'),'q')) ORDER BY tag SEPARATOR ' '),' ')";
 
-#** See also $db_concat_tags_sqlpart
+#** See also $mydb_concat_tags_sqlpart
 #** Dat: elsewhere use the property that tag_to_tagq() appends
 sub tag_to_tagq($) {
   my($tag)=@_;
@@ -550,7 +602,7 @@ sub tag_to_tagq($) {
 }  
 
 #** Dat: this might be sloow
-sub db_repair_taggings() {
+sub mydb_repair_taggings() {
   # !! test with long and lot of tags
   # vvv Dat: no serious need of transaction on `taggings')
   print STDERR "DB_REPAIR_TAGGINGS\n" if $DEBUG;
@@ -559,26 +611,26 @@ sub db_repair_taggings() {
     #db_do("SET SESSION group_concat_max_len = $db_big_31bit"); # !!
     # vvv Dat: this is quite fast on 10000 rows
     # vvv Dat: good, doesn't insert empty `tags'
-    # !! this makes mysqld crash??
+    # !! this makes mysqld crash because of huge group_concat_max_len
     my $rv=db_do("INSERT INTO taggings (fs, ino, tagtxt)
-      SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
+      SELECT fs, ino, $mydb_concat_tags_sqlpart FROM tags
       WHERE fs<>'' GROUP BY ino, fs
       ON DUPLICATE KEY UPDATE tagtxt=VALUES(tagtxt)");
     print STDERR "DB_REPAIR_TAGGINGS affected=$rv\n" if $DEBUG;
   });
 }
 
-sub db_delete_from_taggings_for($$$) {
+sub mydb_delete_from_taggings_for($$$) {
   my($fs,$ino,$tag)=@_;
   if ($tag eq ':all') {
     db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
   } else {
-    db_update_taggings_for($fs,$ino);
+    mydb_update_taggings_for($fs,$ino);
   }
 }
 
 #** Dat: this might be sloow
-sub db_update_taggings_for($$) {
+sub mydb_update_taggings_for($$) {
   my($fs,$ino)=@_;
   # vvv Dat: no serious need of transaction on `taggings')
   print STDERR "DB_UPDATE_TAGGINGS ino=$ino fs=($fs)\n" if $DEBUG;
@@ -590,7 +642,7 @@ sub db_update_taggings_for($$) {
     } else {
       db_do("SET SESSION group_concat_max_len = $db_big_31bit");
       $rv=db_do("INSERT INTO taggings (fs, ino, tagtxt)
-        SELECT fs, ino, $db_concat_tags_sqlpart FROM tags
+        SELECT fs, ino, $mydb_concat_tags_sqlpart FROM tags
         WHERE ino=? AND fs=? GROUP by ino, fs
         ON DUPLICATE KEY UPDATE tagtxt=VALUES(tagtxt)", $ino, $fs);
     }
@@ -598,7 +650,7 @@ sub db_update_taggings_for($$) {
   }, 1);
 }
 
-sub db_rename_tag($$) {
+sub mydb_rename_tag($$) {
   my($oldtag,$newtag)=@_;
   # vvv Dat: this is for GNU mv(1) for `mv meta/tag/old "meta/tag/existing "'
   $newtag=~s@\A\s+@@;  $newtag=~s@\s+\Z(?!\n)@@;
@@ -627,7 +679,7 @@ sub db_rename_tag($$) {
 
 #** @return :List(String) List of files.shortname in decreasing order of
 #**   MySQL fulltext index relevance
-sub db_find_files_matching($) {
+sub mydb_find_files_matching($) {
   my($qs)=@_;
   verify_tag_query_string($qs);
   my $qsq=$qs;
@@ -647,7 +699,7 @@ sub db_find_files_matching($) {
   @$ret
 }
 
-sub db_get_principal($) {
+sub mydb_get_principal($) {
   my $shortname=$_[0];
   my $R=db_query_all("SELECT principal FROM files WHERE shortname=? LIMIT 1",
     $shortname);
@@ -656,12 +708,91 @@ sub db_get_principal($) {
 
 #** Uses the `tags' table.
 #** @return :List(String) in `ORDER BY tags'.
-sub db_file_get_tags($) {
+sub mydb_file_get_tags($) {
   my($fn)=@_;
-  my $principal=$fn;
-  die "not a mirrored filename\n" if $principal!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
-  map { $_->[0] } @{db_query_all("SELECT tag FROM tags, files WHERE principal=? AND files.ino=tags.ino AND files.fs=tags.fs ORDER BY tag",$principal)};
+  my $localname=$fn;
+  die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  # Dat: this is wrong if a file has multiple links:
+  #      return map { $_->[0] } @{db_query_all("SELECT tag FROM tags, files WHERE principal=? AND files.ino=tags.ino AND files.fs=tags.fs ORDER BY tag",$localname)};
+  my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+  map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
+    $ino, $fs)}
 }  
+
+#** @return :String or undef (if file is not tagged)
+sub mydb_file_get_descr($) {
+  my($fn)=@_;
+  my $localname=$fn;
+  die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+  my $L=db_query_all("SELECT descr FROM files WHERE ino=? AND fs=? LIMIT 1",
+    $ino, $fs);
+  @$L ? $L->[0][0] : undef
+}
+
+#** @return :String or undef (if file is not tagged)
+sub mydb_file_set_descr($$) {
+  my($fn,$descr)=@_;
+  my $localname=$fn;
+  die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  verify_utf8($descr);
+  $descr=~s@\s+\Z(?!\n)@@;
+  $descr=~s@\A\s+@@;
+  print STDERR "DB_FILE_SET_DESCR localname=($localname) descr=($descr)\n" if $DEBUG;
+  db_transaction(sub {
+    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    mydb_ensure_fs_ino_name($fs,$ino,$localname);
+    # vvv Dat: we could do this with `WHERE fs=? AND ino=?'
+    my $rv=db_do("UPDATE files SET descr=? WHERE ino=? AND fs=?", $descr, $ino, $fs);
+    mydb_delete_from_files_if_no_info_and_tags($fs,$ino) if $rv and 0==length($descr);
+  });
+}
+
+#** @return :String or undef (if file is not tagged)
+sub mydb_file_set_tagtxt($$) {
+  my($fn,$tagtxt)=@_;
+  my $localname=$fn;
+  die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  my @tags;
+  while ($tagtxt=~m@(\S+)@g) { push @tags, $1; verify_tag($tags[-1]) }
+  db_transaction(sub {
+    print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags)\n" if $DEBUG;
+    # vvv Dat: similar to mydb_file_get_tags()
+    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    # vvv Dat: works even if `fs--ino' is missing from `files'
+    my @old_tags=map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
+      $ino, $fs)};
+    if (join(' ', sort@tags) ne join(' ', sort@old_tags)) {
+      # Imp: DELETE and INSERT only the difference
+      if (@tags) {
+        # Dat: no problem if duplicates in @tags
+        # Imp: optimize, remove duplicates
+        { my %all_tags;
+          # vvv Imp: don't cache statement, and use subset of @tags
+          for my $row (@{db_query_all("SELECT tag FROM tags WHERE ino=0 AND fs=''")}) {
+            $all_tags{$row->[0]}=1
+          }
+          for my $tag (@tags) { die "unknown tag: $tag\n" if !defined $all_tags{$tag} }
+        }
+        # Imp: implement file_shortname_to_fs_ino() in addition to
+        #      file_localname_to_fs_ino() to avoid extra database access
+        print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags) ino=$ino fs=($fs)\n" if $DEBUG;
+        mydb_ensure_fs_ino_name($fs,$ino,$localname);
+        ## vvv Dat: different when row already present
+        db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs);
+        for my $tag (@tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
+          db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
+            $ino, $fs, $tag);
+          #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
+        }
+        mydb_update_taggings_for($fs,$ino); # Dat: a if $had_change_p;
+      } else { mydb_op_untag($fn,':all') }
+    } else {
+      print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags) unchanged\n" if $DEBUG;
+    }
+  });
+}
+
 
 #die $dbh->{AutoCommit};
 #db_connect()->begin_work();
@@ -675,12 +806,14 @@ my %dienerrnos=(
   'bad tag query string' => -1*Errno::EINVAL,
   'bad UTF-8 string' => -1*Errno::EINVAL,
   'tag not found' => -1*Errno::ENOENT,
-  'empty principal' => -1*Errno::EINVAL,
-  'principal not a file' => -1*Errno::ENOTSUP,
-  'principal not found' => -1*Errno::ENOENT,
+  'empty localname' => -1*Errno::EINVAL,
+  'bad slashes in localname' => -1*Errno::EINVAL,
+  'localname not a file' => -1*Errno::ENOTSUP,
+  'localname not found' => -1*Errno::ENOENT,
+  'unknown tag' => -1*Errno::EADDRNOTAVAIL,
   'tag alredy exists' => -1*Errno::EEXIST,
   'tag is in use' => -1*Errno::ENOTEMPTY,
-  'principal on different filesystem' => -1*Errno::EREMOTEIO, # EXDEV, # Dat: bad, mv(1) doesn't get EXDEV, but reports EREMOTEIO properly
+  'localname on different filesystem' => -1*Errno::EREMOTEIO, # EXDEV, # Dat: bad, mv(1) doesn't get EXDEV, but reports EREMOTEIO properly
   'DBD::mysql::st execute failed' => -1*Errno::EIO, # Dat: by db_query()
   'not a mirrored filename' => -1*Errno::EINVAL,
   'not pointing to a mirrored filename' => -1*Errno::EINVAL,
@@ -713,6 +846,7 @@ sub cleanup_umount() {
     system('fusermount -u -- '.fnq($mpoint).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts
   }
 }
+
 sub exit_signal($) {
   #** :String.
   my $sig=$_[0];
@@ -814,7 +948,7 @@ sub my_getattr($) {
   } elsif ($fn=~m@\A/(tag|untag)/([^/]+)\Z(?!\n)@) { # Dat: ls(!) and zsh(1) echo tag/* needs it
     my $op=$1; my $tag=$2;
     return -1*Errno::ENOENT unless ($op eq 'untag' and $tag eq ':all')
-      or eval { db_have_tag($tag) };
+      or eval { mydb_have_tag($tag) };
     #$mode=($mode&0755)|S_IFDIR;
   } elsif ($fn=~m@\A/search/([^/]+)\Z(?!\n)@) { # Dat: seems to be needed for my_getdir
     #$mode=($mode&0755)|S_IFDIR;
@@ -826,7 +960,7 @@ sub my_getattr($) {
     # Dat: skipping `::' lets us use `mv meta/root/any meta/tag/mytag/:'
     # Imp: maybe do a SELECT for each tagged file? Would be too slow...
     my $subdir=$1; my $symlink=$2;
-    #return -1*Errno::ENOENT if !db_have_tag($subdir); # Dat: checked by the previous call, but could be changed since then...)
+    #return -1*Errno::ENOENT if !mydb_have_tag($subdir); # Dat: checked by the previous call, but could be changed since then...)
     $mode=($mode&0644)|S_IFLNK;
   } else {
     # Imp: Errno::EACCES for $mount_point/$mount_point
@@ -846,19 +980,19 @@ sub my_getdir($) {
     # Dat: we need '.' and '..' for both / and others
     return ('.','..','root','search','tag','untag', 0); # $errno
   } elsif ($dir eq '/tag' or $dir eq '/untag') {
-    my @L=eval { db_tags() };
+    my @L=eval { mydb_list_tags() };
     return diemsg_to_nerrno() if $@;
     return ('.','..',($dir eq '/untag' ? ':all' : ()), @L, 0)
   } elsif ($dir eq '/untag/:all') {
-    my @L=eval { db_get_shortnames() };
+    my @L=eval { mydb_get_shortnames() };
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
   } elsif ($dir=~m@\A/search/([^/]+)\Z(?!\n)@) {
-    my @L=eval { db_find_files_matching($1) };
+    my @L=eval { mydb_find_files_matching($1) };
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
   } elsif ($dir=~m@\A/(?:tag|untag)/([^/]+)\Z(?!\n)@) {
-    my @L=eval { db_find_tagged_shortnames($1) };
+    my @L=eval { mydb_find_tagged_shortnames($1) };
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
   } elsif (!defined($real=sub_to_real($dir))) {
@@ -891,6 +1025,9 @@ sub my_read($$$) {
   my $F;
   #$offset=0 if !defined $offset;
   print STDERR "READ($fn,$size,$offset)\n" if $DEBUG;
+  # ^^^ Dat: maximum size for FUSE READ() seems to be 131072 bytes
+  # $size=999 if $size>999; # Dat: bad, short read not allowed, application
+  # still received original $size
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::ENOENT; # can we return this?
   } elsif (!open($F,'<',$real)) {
@@ -964,7 +1101,7 @@ sub my_unlink($) {
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(?:tag|untag)/([^/]+)/([^/]+)\Z(?!\n)@) {
       my $tag=$1; my $shortname=$2;
-      eval { db_op_untag_shortname($shortname,$tag) };
+      eval { mydb_op_untag_shortname($shortname,$tag) };
       return diemsg_to_nerrno()
     }
     return -1*Errno::EPERM
@@ -972,7 +1109,7 @@ sub my_unlink($) {
     my($dev,$ino,$mode,$nlink)=lstat($real);
     if (defined $nlink and $nlink>1) {
       # ^^^ Dat: this check has a race condition only 
-      return -1*Errno::EPERM if db_fn_is_principal($fn);
+      return -1*Errno::EPERM if mydb_fn_is_principal($fn);
     }
     return -1*$! if !unlink($real);
   }
@@ -986,7 +1123,7 @@ sub my_rmdir($) {
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(?:tag|untag)/([^/]+)\Z(?!\n)@) {
       my $tag=$1;
-      eval { db_delete_tag($tag); };
+      eval { mydb_delete_tag($tag); };
       return diemsg_to_nerrno();
     }
     return -1*Errno::EPERM
@@ -1005,10 +1142,10 @@ sub my_mkdir($$) {
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(?:tag|untag)/([^/]+)\Z(?!\n)@) {
       my $tag=$1;
-      eval { db_insert_tag($tag); };
+      eval { mydb_insert_tag($tag); };
       return diemsg_to_nerrno();
     } elsif ($fn eq '/repair_taggings') {
-      eval { db_repair_taggings(); };
+      eval { mydb_repair_taggings(); };
       return diemsg_to_nerrno();
       # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
       #          and return Errno::ENOENT to the application.
@@ -1094,16 +1231,16 @@ sub my_rename($$) {
   print STDERR "RENAME($oldfn,$fn)\n" if $DEBUG;
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(tag|untag)/([^/]+)/[^/]+\Z(?!\n)@) {
-      # Dat: db_op_tag() and db_op_untag() verify if $oldfn is a mirrored filename,
+      # Dat: mydb_op_tag() and mydb_op_untag() verify if $oldfn is a mirrored filename,
       #      no need to check defined(sub_to_real($oldfn))
       my $op=$1; my $tag=$2;
-      eval { $op eq 'tag' ? db_op_tag($oldfn,$tag) : db_op_untag($oldfn,$tag) };
+      eval { $op eq 'tag' ? mydb_op_tag($oldfn,$tag) : mydb_op_untag($oldfn,$tag) };
       return diemsg_to_nerrno()
     } elsif ($fn=~m@/(tag|untag)/([^/]+)\Z(?!\n)@) {
       my $op=$1; my $tag=$2;
       if ($oldfn=~m@/(tag|untag)/([^/]+)\Z(?!\n)@) {
         my $oldop=$1; my $oldtag=$2;
-        eval { db_rename_tag($oldtag,$tag) };
+        eval { mydb_rename_tag($oldtag,$tag) };
         return diemsg_to_nerrno()
       }
     }
@@ -1113,7 +1250,7 @@ sub my_rename($$) {
   } elsif (!rename($oldreal,$real)) {
     return -1*$!
   } else {
-    eval { db_rename_fn($oldfn,$fn) };
+    eval { mydb_rename_fn($oldfn,$fn) };
     return diemsg_to_nerrno()
   }
 }
@@ -1128,7 +1265,7 @@ sub my_readlink($) {
     my $shortname=spec_symlink_get_shortname($fn);
     if (defined $shortname) {
       #print STDERR "SS $shortname\n";
-      my $principal=eval { db_get_principal($shortname) };
+      my $principal=eval { mydb_get_principal($shortname) };
       return diemsg_to_nerrno() if $@;
       return defined($principal) ? "../../root/$principal" : -1*Errno::ENOENT
     }
@@ -1185,12 +1322,15 @@ sub my_listxattr($) {
   my @attrs;
   print STDERR "LISTXATTR($fn)\n" if $DEBUG;
   # Dat: getfattr(1) `getfattr -d' needs the "user." prefix
-  if (!defined($real=sub_to_real($fn))) {
-    push @attrs, 'user.fakefile';
+  if ($fn eq '/root' or !defined($real=sub_to_real($fn))) {
+    # Dat: `meta/root' is also a fakenode, since it doesn't have a valid
+    #      $localname
+    push @attrs, 'user.fakenode';
   } else {
-    push @attrs, 'user.realfile';
+    push @attrs, 'user.realnode';
+    push @attrs, 'user.tags'; # Dat: lazy here, even for files with no tags
+    push @attrs, 'user.description'; # Dat: lazy here, even for files with an empty description
   }
-  push @attrs, 'user.tags'; # Dat: lazy here, even for files with no tags
   push @attrs, 0; # $errno indicator
   #print STDERR "ATTRS=@attrs\n";
   @attrs
@@ -1204,19 +1344,25 @@ sub my_getxattr_low($$) {
   my($fn,$attrname)=@_;
   my $real=sub_to_real($fn);
   # Imp: maybe return non-zero errno
-  if ($attrname eq 'user.fakefile') {
+  if ($attrname eq 'user.fakenode') {
     return defined($real) ? 0 : "1"
-  } elsif ($attrname eq 'user.realfile') {
+  } elsif ($attrname eq 'user.realnode') {
     return defined($real) ? "1" : 0
   } elsif ($attrname eq 'user.tags') {
     return 0 if !defined $real;
-    my @tags=eval { db_file_get_tags($fn) };
+    my @tags=eval { mydb_file_get_tags($fn) };
+    return '' if $@ eq "localname not a file\n"; # Imp: test after preprocessing
     return diemsg_to_nerrno() if $@;
     join(' ',@tags)
+  } elsif ($attrname eq 'user.description') {
+    return 0 if !defined $real;
+    my $descr=eval { mydb_file_get_descr($fn) };
+    return '' if $@ eq "localname not a file\n"; # Imp: test after preprocessing
+    return diemsg_to_nerrno() if $@;
+    defined$descr ? $descr : ''
   }
 }
 
-#** Dat: this is fake, see `man 5 attr' and `man 2 lgetxattr' for more
 sub my_getxattr($$) {
   my($fn,$attrname)=@_;
   print STDERR "GETXATTR($fn,$attrname)\n" if $DEBUG;
@@ -1224,24 +1370,46 @@ sub my_getxattr($$) {
 }
 
 #** Dat: this is fake, see `man 5 attr' and `man 2 lgetxattr' for more
-sub my_setxattr($$$) {
-  my($fn,$attrname,$flags)=@_;
-  #my $real;
-  print STDERR "SETXATTR($fn,$attrname,$flags)\n" if $DEBUG;
-  # Dat: we can use XATTR_CREATE and XATTR_REPLACE from Fuse::
+#** Dat: `setfattr -n attrname filename' => $attrval eq ""
+#** Dat: `setfattr -n attrname -v notempty filename'
+sub my_setxattr_low($$$$) {
+  my($fn,$attrname,$attrval,$flags)=@_;
+  # Dat: we can safely ignore $flags|Fuse::XATTR_CREATE and Fuse::XATTR_REPLACE
+  my $real=sub_to_real($fn);
+  return -1*Errno::EPERM if !defined($real);
+  # Imp: maybe return non-zero errno
+  if ($attrname eq 'user.tags') {
+    eval { mydb_file_set_tagtxt($fn,$attrval) };
+    return diemsg_to_nerrno();
+  } elsif ($attrname eq 'user.description') {
+    eval { mydb_file_set_descr($fn,$attrval) };
+    return diemsg_to_nerrno();
+  } elsif (my_getxattr_low($fn,$attrname) eq $attrval) {
+    # ^^^ Imp: `eq' on error messages
+    # Dat: this is so `setxattr --restore' runs cleanly on `user.realnode'
+    return 0
+  }
   return -1*Errno::EPERM
 }
 
+sub my_setxattr($$$$) {
+  my($fn,$attrname,$attrval,$flags)=@_;
+  print STDERR "SETXATTR($fn,$attrname,$attrval,$flags)\n" if $DEBUG;
+  my_setxattr_low($fn,$attrname,$attrval,$flags)
+}
+
 #** Dat: this is fake, see `man 5 attr' and `man 2 lgetxattr' for more
+#** Dat: `setfattr -x attrname filename'
 sub my_removexattr($$) {
   my($fn,$attrname)=@_;
   print STDERR "REMOVEXATTR($fn,$attrname)\n" if $DEBUG;
+  my_setxattr_low($fn,$attrname,"",0); # Imp: smarter
   # vvv Imp: disinguish "0" and 0 (with Scalar::Util?)
-  if (my_getxattr_low($fn,$attrname)eq"0") { # Dat: no such attribute
-    return -1*Errno::ENOATTR
-  } else {
-    return -1*Errno::EPERM
-  }
+  #if (my_getxattr_low($fn,$attrname)eq"0") { # Dat: no such attribute
+  #  return -1*Errno::ENOATTR
+  #} else {
+  #  return -1*Errno::EPERM
+  #}
 }
 
 # --- main()
@@ -1257,7 +1425,7 @@ sub my_removexattr($$) {
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
     elsif ($ARGV[$I] eq '--version') {
-      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.9 2007-01-06 00:35:24 pts Exp $'."\n";
+      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.10 2007-01-06 21:32:03 pts Exp $'."\n";
       print STDERR "by Pe'ter Szabo' since early January 2007\n";
       print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
       exit 0
@@ -1271,6 +1439,13 @@ sub my_removexattr($$) {
 die "$0: missing --mount-point=, see README.txt\n" if !defined $mpoint or 0==length($mpoint);
 die "$0: cannot find mpoint\n" if !defined($mpoint=Cwd::abs_path($mpoint)) or
   substr($mpoint,0,1)ne"/" or length($mpoint)<2 or $mpoint=~m@//@;
+#print STDERR "D".(-d $mpoint);
+# vvv SUXX: it works only every 2nd time because of fusermount stale etc.
+my @L=lstat($mpoint);
+#print STDERR "$!..\n" if !@L;
+if ((@L or $! !=Errno::ENOTCONN) and !(-d _)) {
+  die "$0: cannot create mpoint $mpoint: $!\n" if !mkdir($mpoint);
+}
 
 $root_prefix=~s@//+@/@g;
 $root_prefix=~s@/*\Z(?!\n)@/@;
@@ -1315,9 +1490,7 @@ my @write_ops=(
   chmod=>    \&my_chmod, # !ro
   chown=>    \&my_chown, # !ro
   utime=>    \&my_utime, # !ro
-  # vvv !! why do we get setxattr("f/root/tmp/almaa", "user.realfile", "", 0, ) = -1 EOPNOTSUPP (Operation not supported)
   setxattr=>   \&my_setxattr, # !ro
-  # vvv !! why do we get setxattr("f/root/tmp/almaa", "user.realfile", "", 0, ) = -1 EOPNOTSUPP (Operation not supported)
   removexattr=>\&my_removexattr, # !ro
 );
 
@@ -1333,3 +1506,4 @@ Fuse::main(mountpoint=>$mpoint,
 #     could not mount fuse filesystem!
 
 __END__
+

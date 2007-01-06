@@ -7,7 +7,8 @@ audio and text files) by simply moving the files to a special folder using
 any file manager, and it also lets users find files by tags, using a boolean
 search query. The original files (and their names) are kept intact.
 movemetafs doesn't have its own user interface, but it is usable with any
-file manager.
+file manager. movemetafs also lets users attach (unsearchable) textual
+description to files.
 
 In the name `movemetafs', `metafs' means filesystem metadata store, and
 `move' refers to the most common way tags are added or removed: the user
@@ -35,6 +36,8 @@ Features of movemetafs:
    possiblity of boolean search (i.e. searching for files matching a
    combination of tags)
 -- copy search results to make backups or to create collections
+-- attach textual descriptions to files, and read the description once the
+   file is found
 -- Searching is fast, because it uses a fulltext index.
 -- After installation, movemetafs can be used on an existing filesystem
    instantly: there is no migration needed to make an existing filesystem usable with
@@ -48,6 +51,10 @@ Features of movemetafs:
 -- Stores tags in twice: once in a fulltext indexed column in a MyISAM
    table, and once in an InnoDB relational table. Uses the fast MyISAM
    table for searches, and the InnoDB table for data recovery.
+-- Treats file names as opaque 8-bit strings, thus it works with any
+   filesystem character set, even when character sets are mixed in the
+   middle of the filename.
+-- Uses UTF-8 for tag names and descriptions.
 
 Current limitations:
 
@@ -58,8 +65,6 @@ Current limitations:
 -- cannot cross filesystem boundaries
 -- doesn't survive a mkfs + rsync migration
 -- tags are lost when the file is copied (use md5sums?)
--- filesystem encoding is fixed (opaque, not converted to UTF-8)
--- no quick way for
 -- no large file support (maximum file size is 2GB -- limitation of the Fuse
    Perl module)
 -- works only with systems with FUSE support (such as Linux)
@@ -71,7 +76,7 @@ Current limitations:
 -- search result symlink might be stale (i.e. it may not point to the
    correct target file) if the file has been moved outside the control of
    movemetafs
--- FUSE is a little slower than other layers such as Unionfs
+-- FUSE is a little slower than other layers such as Unionfs or Relayfs
 -- Perl Fuse.pm is a little slower than writing a Fuse module in C
 -- no logic structuring (such as taxonomy, thesaurus or ontology) and
    inference
@@ -84,6 +89,7 @@ Current limitations:
 -- searching is faster than tagging and untagging
 -- tags cannot be multiple levels deep (i.e. contain `/')
 -- no `$TAGNAME1 OR $TAGNAME2' searches
+-- file descriptions are not searchable
 
 Requirements (install them in this order):
 
@@ -112,11 +118,14 @@ Basic usage scenario (the order of the steps might vary):
 2. movemetafs is installed and started.
 3. Tag names are designed, empty tags are added.
 4. Some files are tagged with existing tag names.
-5. Searches are performed based on tag names. Search results are presented
+5. Textual description is added for some files.
+6. Searches are performed based on tag names. Search results are presented
    as symlinks to normal files. on the filesystem. The name of the symlink
    is similar to the name of the original files (but ambiguities are
    resolved).
-6. As an overall effect, with movemetafs files are much easier to find, and
+7. Tag names and descriptionsa re retrieved as POSIX extended
+   attributes (getfattr(1), `getfattr -d -e text -- $FILENAME').
+8. As an overall effect, with movemetafs files are much easier to find, and
    it is easy to make file collection based on a specific theme.
 
 Installation quickstart
@@ -221,18 +230,47 @@ different st_dev value will result in a `Remote I/O error' (EREMOTEIO).
 No other restrictions are present when accessing files with different
 st_dev value in `meta/root'.
 
+Description: Each file has a textual description associated with it, which
+can be used to add additional information (such as the story depicted on the
+media file or the story of the file creation itself). The description is not
+stored on the real filesytem, but in the MySQL database. The
+description can be read and written using the `user.description' POSIX
+extended attribute. Each file has an empty description by default. The
+maximum description length is 65535 bytes (because setfattr(1) cannot pass
+longer POSIX extended attributes to FUSE Perl scripts -- the limit on the
+size of MySQL `text' fields is much larger).
+
+Character sets (== encodings) and collations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 movemetafs handles filenames as opaque 8-bit strings (thus filenames can be
 in any character set, or in a mixture of character sets). All characters are
 allowed in filenames (except for `/' and "\0", of course, which are not
 allowed in any UNIX filename). Maximum filename length (checked by both
 MySQL and Linux) is 255 bytes.
 
-movemetafs refuses to add tags with a nome not in UTF-8. The software makes
+movemetafs refuses to add tags with a name not in UTF-8. The software makes
 no attempt to convert to UTF-8 from a local character set specified by the
 locale (LC_CTYPE etc.) -- because this information is not available to FUSE.
 MySQL `COLLATE utf8_general_ci' is used for sorting and comparing tags
 (which is case-insensitive, accent-insensitive and
 trailing-space-insensitive), see above.
+
+movemetafs refuses to set descriptions not in UTF-8. All characters,
+including "\0" are allowed. To add a description containing "\0", create
+an attribute dump file attr_dump:
+
+  # file: meta/root/dir/file
+  user.description="a\000\142"
+
+Then restore the dump:
+
+  $ setfattr --restore=attr_dump
+
+You can verify that all 3 bytes are present:
+
+  $ getfattr -d -e text -- meta/root/dir/file
+  # file: meta/root/dir/file
+  user.description="a\000b"
 
 How to use
 ~~~~~~~~~~
@@ -244,7 +282,8 @@ The most important options for mmfs_fuse.pl:
 
 -- --root-prefix=<dir>: the carrier filesystem folder, this will be
    visible as `meta/root'. This option is recommended (default: current
-   directory of the ./mmfs_fuse.pl program invocation).
+   directory of the ./mmfs_fuse.pl program invocation). You may
+   have to create this folder manually before starting mmfs_fuse.pl.
 -- --mount-point=<dir>: folder writable by you to which the meta
    filesystem is mounted, i.e. `meta/root' will be `<dir>/root'. This option
    is mandatory.
@@ -292,8 +331,31 @@ Special operations with files in meta/root:
    to be removed (Operation not permitted, EPERM). This a a safety feature
    that prevents the `files.principal' column getting stale. See more
    in ``Principal name''.
--- `getfattr -d -e text meta/root/.../$FILENAME' displays all tags associated with
-   the file in the `user.tags' field.
+-- `getfattr -d -e text meta/root/.../$FILENAME' displays all tags
+   associated with the file in the `user.tags' attribute (sorted and joined
+   by a single space) and the file's description in the `user.description'
+   attribute. If no tags are associated with the file, `user.tags' is empty.
+   If no description has been set for the file, `user.description' is empty.
+
+   Each file (and other node) in `meta/root' (but not `meta/root' itself)
+   has the attribute `user.realnode' with value `1'. All other nodes have
+   the attribute `user.fakenode' with value `1'.
+-- `setfattr -n user.tags -v "$TAGS" $meta/root/.../$FILENAME' can be used
+   to set the tags associated with the file. All tags specified in the
+   whitespace-separated tag list $TAGS get added to $FILENAME, and all
+   other tags get removed from it. Please note that if $TAGS is
+   empty, you have to omit `-v'.
+-- `setfattr -n user.description -v "$DESCRIPTION" $meta/root/.../$FILENAME'
+   can be used to set the file's description to $DESCRIPTION. Please note
+   that $DESCRIPTION must be specified in UTF-8. Please note that if
+   $DESCRIPTION is empty, you have to omit the `-v' option of `setfattr'.
+-- POSIX extended attributes cannot be removed (e.g. with `setfattr -x')
+   in the meta filesystem. An attempt to remove an attribute is equivalent
+   to setting its value to the empty string.
+-- Attributes cannot be modified, except for `user.description' and
+   `user.tags'. An attempt to modify another attribute succeeds if the old
+   and new values are the same, and returns `Operation not permitted'
+   otherwise.
 
 Besides `meta/root', there are also some special folders ain `meta/', which
 behave quite differently from regular filesystems. Permissions and
@@ -580,7 +642,7 @@ How to contribute
 
    -- your favourite file manager, e.g. Midnight Commander, KDE file
       manager, Gnome file manager;
-   -- your favourite image viewer, e.g. qiv, xv;
+   -- your favourite image viewer, e.g. GQview, qiv, xv;
    -- your favourite media player, e.g. MPlayer, VLC, Xine, Totemp;
    -- your favourite music player or organizer, e.g. XMMS;
    -- your favourite autindexer, e.g. Beagle
@@ -604,6 +666,15 @@ possible, and send your report in e-mail to Péter Szabó <pts@fazekas.hu>.
 
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
+!! feature: setxattr on user.tags and user.description
+!! feature: empty meta/tag/$TAGNAME and meta/untag/$TAGNAME folders,
+   list files in meta/tagged/$TAGNAME
+!! doc: qiv-command `mv' support
+!! feature: import tags from ~/.gqview/metadata/home/you/foo.jpg.meta
+!! feature: patch GQview to use us (setxattr) instead of ~/.gqview/metadata
+   Dat: gqview is good, always use UTF-8 in .meta files
+   Change at `Store keywords and comments local to source images'.
+!! feature: tag-add-timestamp for easy undo
 !! configure: ft_max_word_len (global?): now it is 64 -- is it Unicode?
 !! Dat: if you do not want _mangé_ to match with _mange_ (this example is in
    French), you have no choice but to use the BOOLEAN MODE with the double
@@ -701,5 +772,30 @@ Improvement possibilites
    `mv /tmp/mp/tag/bar/\:5d53a\:F\:one /tmp/mp/tag/űrkikötő/',
    but what if we then get an `Operation not permitted'.
 !! easy: --config-file=
+!! fix: avoid target file already exists when moving to `meta/tag/$TAGNAME'
+   in Midnight Commander; What if symlink by that name already exists?
+	   Better to keep `meta/tag' empty.
+!! SUXX: qiv, when moving to .qiv_trans, tries to remove principal name :-(
+   unlink() fails, 2 links to file remain
+!! feature: fulltext search on descriptions
+!! .qiv_trash symlink exists...: (but allows deletion from .qiv-trash)
+    GETATTR(/root/proba/.qiv-trash)
+    READLINK(/root/proba/.qiv-trash)
+    GETATTR(/tag)
+    GETATTR(/tag/bar)
+    DB_HAVE_TAG(bar)
+    DB_HAVE_TAG(bar) = 1
+    READLINK(/root/proba/.qiv-trash)
+    GETATTR(/tag/bar/minishot.jpg)
+    UNLINK(/tag/bar/minishot.jpg)
+    DB_OP_UNTAG_SHORTNAME shortname=(minishot.jpg) tag=(bar)
+    GETATTR(/root/proba/minishot.jpg)
+    READLINK(/root/proba/.qiv-trash)
+    GETATTR(/tag/bar/minishot.jpg)
+    OPEN(/root/proba/minishot.jpg,0)
+    READ(/root/proba/minishot.jpg,16384,0)
+    FLUSH(/root/proba/minishot.jpg)
+    RELEASE(/root/proba/minishot.jpg)
+
 
 __END__
