@@ -148,6 +148,19 @@ Basic usage scenario (the order of the steps might vary):
 8. As an overall effect, with movemetafs files are much easier to find, and
    it is easy to make file collection based on a specific theme.
 
+To organize your images, GQview (>=2.0, we tried 2.1.5) is recommended.
+Pressing Ctrk-<K> in GQview lets you enter keywords and a comment for the
+image. In our movemetafs terminology, `keyword' is named tag, and `comment'
+is named description. By default, GQview stores metadata (i.e. tags and the
+description) in a *.meta file (near the image file or in
+~/.gqview/metadata). We have prepared a patch to GQview-2.1.5, which will
+make GQview store metadata in the movemetafs metadata store for images
+inside `meta/root'.  This makes GQview a very nice and powerful user
+interface for movemetafs when managing images.
+!! more about this patch
+!! emulate read and write of *.meta files (not enough detail in error
+   messages)
+
 Installation quickstart
 ~~~~~~~~~~~~~~~~~~~~~~~
 !! this section isn't written properly
