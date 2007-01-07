@@ -80,14 +80,16 @@ CREATE TABLE tags (
 -- Dat: root_ino=mpoint_ino  except if mpoint='/'
 -- Dat: fs is not empty
 -- Dat: mpoint is UNIQUE (but keysize is too large for InnoDB)
+-- Dat: fs='' is used for insertion
 DROP TABLE IF EXISTS fss;
 CREATE TABLE fss (
+  id INTEGER UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   fs VARBINARY(127) NOT NULL UNIQUE,
-  mpoint VARBINARY(32000) NOT NULL,
-  dev INTEGER UNSIGNED NOT NULL UNIQUE,
-  root_ino INTEGER UNSIGNED NOT NULL,
-  top_ino INTEGER UNSIGNED NOT NULL,
-  CHECK(fs<>''),
-  CHECK(mpoint<>''),
-  INDEX(mpoint)
+  dev INTEGER UNSIGNED NOT NULL UNIQUE
 ) ENGINE=InnoDB;
+-- !!
+--   root_ino INTEGER UNSIGNED NOT NULL,
+--   top_ino INTEGER UNSIGNED NOT NULL,
+--   CHECK(mpoint<>''),
+--   INDEX(mpoint)
+--   mpoint VARBINARY(32000) NOT NULL,

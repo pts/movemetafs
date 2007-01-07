@@ -1,5 +1,5 @@
 README for movemetafs
-by pts@fazekas.hu at Sat Jan  6 01:37:45 CET 2007
+by pts@fazekas.hu at Sun Jan  7 23:19:17 CET 2007
 
 movemetafs is a searchable filesystem metadata store for Linux (with MySQL,
 Perl and FUSE), which lets users tag local files (including image, video,
@@ -108,14 +108,11 @@ Current limitations:
    only one of filenames (usually the oldest) -- the other filenames are not
    stored by movemetafs.
 -- For files with multiple (hard) links, the principal name cannot be
-   removed. (But it can be changed.)
--- it is not totally convenient to remove the principal instance of a tagged
-   file with multiple hard links
--- POSIX extended attributes and ACLs are not mirrorred
--- searching is faster than tagging and untagging
--- tags cannot be multiple levels deep (i.e. contain `/')
--- no `$TAGNAME1 OR $TAGNAME2' searches
--- file descriptions are not searchable
+   easily removed. (But it can be changed.)
+-- Original POSIX extended attributes and ACLs are not mirrorred.
+-- Searching is much faster than tagging and untagging.
+-- Tags cannot be multiple levels deep (i.e. contain `/').
+-- File descriptions are not searchable.
 
 Dependencies (install them in this order):
 
@@ -222,11 +219,10 @@ Basic concepts: carrier and meta filesystems etc.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 There are two filesystems: the carrier and the meta. The carrier filesystem
 is the one that stores the actual files (and directory structure).
-Currently, the carrier must be a mount point (or a subfolder of a mount
-point) of a real filesystem not containing any other mount points -- thus a
-carrier cannot span over multiple filesystems. This restriction is not
-enforced (but you risk having your metadata garbled if you don't take care).
-The restriction will be removed in the future.
+As of version 0.05, it doesn't matter how many real mount points (and
+different st_dev values) the carrier has -- it can span multiple filesystem.
+(But please read more about the rare unsafe operations on filesystems
+in the section ``Migration''.)
 
 Typically, even before installing movemetafs, you have a carrier filesystem
 with a lot of files, among which you sometimes cannot easily find what you
@@ -294,15 +290,11 @@ shortening it to 255 bytes when necessary, and adding a unique prefix
 of the form `:<ino-hex>:<fs>:' if multiple files have the same shortened
 principal, shortened again if necessary.
 
-In the current version of movemetafs, tagged files cannot span multiple
-filesystems, i.e. all of them must have the same st_dev value in their
-lstat(2) structure, and this st_dev value must be the same as the value for
-the root folder of the carrier filesystem (--root-prefix=). This is
-automatically ensured if --root-prefix= doesn't have any mount points deep
-inside it (check it in /proc/mounts). Attempts to tag or untag files with a
-different st_dev value will result in a `Remote I/O error' (EREMOTEIO).
-No other restrictions are present when accessing files with different
-st_dev value in `meta/root'.
+No restrictions are present when accessing files with different st_dev value
+in `meta/root'. In versions before 0.05, attempts to tag or untag files with
+a different st_dev value (than of `root.prefix') resulted in a `Remote I/O
+error' (EREMOTEIO). Now this restriction is removed, but please read section
+``Migration'' about possibly unsafe filesystem operatios.
 
 Description: Each file has a textual description associated with it, which
 can be used to add additional information (such as the story depicted on the
@@ -673,6 +665,9 @@ Special folders are:
    -- The folder `meta/adm' appears to contain a few empty folders.
    -- `meta/adm' can be used to issue administrative and recovery commands
       to movemetafs.
+   -- If the folder `meta/adm/reload_fss' is attempted to be created,
+      movemetafs reloads the `fss' table into its local cache, and
+      the operation returns `No such file or directory' on success.
    -- If the folder `meta/adm/repair_taggings' is attempted to be created,
       movemetafs regenerates the `taggings' table from the `tags' table, and
       the operation returns `No such file or directory' on success. This
@@ -1010,11 +1005,6 @@ Why did we choose Perl?
 
 -- It is easy to add logging facilities to Perl scripts.
 
-The reason why tagged files cannot span filesystem boundaries is that if
-we store st_dev, and then the user changes the hard drive (i.e. by attaching
-another drive in front of it), all st_dev values become bogus. A solution
-better than spanning should be designed in further versions of movemetafs.
-
 How to contribute
 ~~~~~~~~~~~~~~~~~
 -- Integrate movemetafs.pl tagging and searching functionality to:
@@ -1045,6 +1035,8 @@ possible, and send your report in e-mail to Péter Szabó <pts@fazekas.hu>.
 
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
+!! test: rename across mount points with GNU mv(1). GNU mv(1) doesn't seem
+   to preserve extended attributes
 !! doc: more about the GQview patch
 !! doc: how to tag images, videos etc.
 !! feature: emulate read and write of *.meta files (not enough detail in error
@@ -1176,27 +1168,12 @@ Improvement possibilites
 !! feature: fulltext search on descriptions
 !! feature: edit extended attributes in Midnight Commander
 !! test suite
+!! SUXX: getfattr(1) calls FUSE LISTXATTR twice -- why? Be smart, Perl...
 !! feature: remove stale files
 !! feature: keep metadata after file has been removed
 !! feature: SYMLINK(../../root/proba/b,/root/proba/c/b)
    <- mv /tmp/mp/tagged/food/b /tmp/mp/root/proba/c
-!! .qiv_trash symlink exists...: (but allows deletion from .qiv-trash)
-    GETATTR(/root/proba/.qiv-trash)
-    READLINK(/root/proba/.qiv-trash)
-    GETATTR(/tag)
-    GETATTR(/tag/bar)
-    DB_HAVE_TAG(bar)
-    DB_HAVE_TAG(bar) = 1
-    READLINK(/root/proba/.qiv-trash)
-    GETATTR(/tag/bar/minishot.jpg)
-    UNLINK(/tag/bar/minishot.jpg)
-    DB_OP_UNTAG_SHORTNAME shortname=(minishot.jpg) tag=(bar)
-    GETATTR(/root/proba/minishot.jpg)
-    READLINK(/root/proba/.qiv-trash)
-    GETATTR(/tag/bar/minishot.jpg)
-    OPEN(/root/proba/minishot.jpg,0)
-    READ(/root/proba/minishot.jpg,16384,0)
-    FLUSH(/root/proba/minishot.jpg)
-    RELEASE(/root/proba/minishot.jpg)
+!! feature: rename fs in fss
+!! measure: do we need the %dev_to_fss cache?
 
 __END__

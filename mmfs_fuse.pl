@@ -109,7 +109,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.16 2007-01-07 20:35:30 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.17 2007-01-07 22:19:38 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -303,6 +303,8 @@ sub db_do {
 #** See mysql/mysqld_ername.h
 sub ER_DUP_ENTRY() { 1062 }
 
+my @db_on_die_rollback;
+
 #** @param $maybe_p proceed if already inside a transaction
 sub db_transaction($;$) {
   my($sub,$maybe_p)=@_;
@@ -312,11 +314,17 @@ sub db_transaction($;$) {
     $ret=$sub->();
   } else {
     $dbh->begin_work();
+    @db_on_die_rollback=();
     $ret=eval { $sub->() }; # Imp: wantarray()
     if ($@) {
-      $dbh->rollback() if !$dbh->{AutoCommit};
-      die $@;
+      my $err=$@;
+      if (!$dbh->{AutoCommit}) {
+        $dbh->rollback();
+        for my $sub (@db_on_die_rollback) { $sub->() }
+      }
+      die $err;
     } else {
+      @db_on_die_rollback=();
       $dbh->commit() if !$dbh->{AutoCommit};
     }
   }
@@ -324,9 +332,6 @@ sub db_transaction($;$) {
 }
 
 # -- movemetafs-specific database routines (mydb_*())
-
-my $all_fs;
-my $all_dev; # st_dev of "$config{'root.prefix'}/."
 
 sub verify_tag($) {
   my($tag)=@_;
@@ -502,27 +507,83 @@ sub verify_localname($) {
     substr($localname,-1)eq'/' or index($localname,'//')>=0;
 }
 
-#** Dat: change this to have multiple filesystem support
-#** @return ($fs,$ino)
-sub file_localname_to_fs_ino($;$) {
-  my($localname,$allow_nonfile_p)=@_;
-  my @st;
-  die "localname not found\n" unless @st=lstat($config{'root.prefix'}.$localname);
-  die "localname not a file\n" if !$allow_nonfile_p and !-f _;
-  die if !defined($all_fs) or 0==length($all_fs);
-  die if !defined($all_dev);
-  die "localname on different filesystem\n" if $st[0] ne $all_dev;
-  ($all_fs,$st[1]) # Imp: better than $all_fs
+#** Cache of the table `fss'.
+#** Test with `defined' (not `exists') because of @db_on_die_rollback.
+my %dev_to_fs;
+
+sub mydb_fill_dev_to_fs() {
+  my $sth=db_query("SELECT dev, fs FROM fss");
+  %dev_to_fs=();
+  while (my($dev,$fs)=$sth->fetchrow_array()) {
+    $dev_to_fs{$dev}=$fs
+  }
+}
+
+#** Dat: separate subroutine to have as few `my' as possible
+sub mydb_rollback_dev_to_fs($) {
+  return if $dbh->{AutoCommit};
+  my($dev)=@_;
+  my $oldfs=$dev_to_fs{$dev};
+  push @db_on_die_rollback, sub { $dev_to_fs{$dev}=$oldfs; undef };
+}
+
+#** Dat: needs transaction
+#** Possibly autoassigns a new fs.
+#** @return $fs (existing or generated)
+sub mydb_insert_fs($;$) {
+  my($dev,$fs)=@_;
+  print STDERR "DB_INSERT_FS dev=$dev\n" if $config{'verbose.level'};
+  db_transaction(sub {
+    my $L=db_query_all("SELECT fs FROM fss WHERE dev=? LIMIT 1", $dev);
+    if (@$L) { # Dat: somebody has inserted it
+      $fs=$L->[0][0];
+    } else {
+      $fs='' if !defined $fs;
+      if (0==length($fs)) {
+        if (!@{db_query_all("SELECT 1 FROM fss LIMIT 1")}) {
+          $fs=$config{'default.fs'}; # Dat: can be empty
+        }
+      }
+      db_do("DELETE FROM fss WHERE fs=''") if 0==length($fs);
+      # vvv Imp: robust, what if already inserted?
+      db_do("INSERT INTO fss (fs,dev) VALUES (?,?)", $fs, $dev);
+      if (0==length($fs)) {
+        $fs=$dbh->{'mysql_insertid'};
+        die "bad insertid: $fs.\n" if !defined($fs) or $fs<1;
+        $fs=".$fs";
+        db_do("UPDATE fss SET fs=? WHERE fs=''", $fs);
+      }
+    }
+  },1);
+  print STDERR "DB_INSERT_FS dev=$dev fs=($fs)\n" if $config{'verbose.level'};
+  mydb_rollback_dev_to_fs($dev); # Dat: remove from cache on rollback
+  return $dev_to_fs{$dev}=$fs
 }
 
 #** Dat: change this to have multiple filesystem support
-sub file_st_to_fs_ino($$) {
+#** @return ($fs,$ino)
+sub mydb_file_localname_to_fs_ino($;$$) {
+  my($localname,$allow_nonfile_p,$allow_unknown_fs_p)=@_;
+  die if db_connect()->{'AutoCommit'} and !$allow_unknown_fs_p;
+  # ^^^ Dat: needs a transaction if $fs must be known
+  my($dev,$ino);
+  die "localname not found\n" unless
+    ($dev,$ino)=lstat($config{'root.prefix'}.$localname);
+  die "localname not a file\n" if !$allow_nonfile_p and !-f _;
+  my $fs=$dev_to_fs{$dev};
+  $fs=mydb_insert_fs($dev) if !defined$fs and !$allow_unknown_fs_p;
+  #die "GOT fs=($fs)\n";
+  ($fs,$ino)
+}
+
+#** Dat: change this to have multiple filesystem support
+sub mydb_file_st_to_fs_ino($$) {
   my($st_dev,$st_ino)=@_;
-  #die "localname not a file\n" if !$allow_nonfile_p and !-f _;
-  die if !defined($all_fs) or 0==length($all_fs);
-  die if !defined($all_dev);
-  die "localname on different filesystem\n" if $st_dev ne $all_dev;
-  ($all_fs,$st_ino) # Imp: better than $all_fs
+  die if db_connect()->{'AutoCommit'}; # Dat: needs transaction
+  my $fs=$dev_to_fs{$st_dev};
+  $fs=mydb_insert_fs($st_dev) if !defined$fs;
+  #print STDERR "DB_FILE_ST_TO_FS_INO fs=($fs) st_dev=($st_dev)\n";
+  ($fs,$st_ino)
 }
 
 #** Doesn't do any insert if ($fs,$ino) already exists in `files'.
@@ -549,7 +610,7 @@ sub mydb_ensure_fs_ino_name($$$) {
   my($fs,$ino,$localname)=@_;
   verify_localname($localname);
   db_transaction(sub {
-    ($fs,$ino)=file_localname_to_fs_ino($localname) if !defined$ino; # Dat: this might die()
+    ($fs,$ino)=mydb_file_localname_to_fs_ino($localname) if !defined$ino; # Dat: this might die()
     mydb_insert_fs_ino_principal($fs,$ino,$localname);
   },1);
 }
@@ -581,32 +642,52 @@ sub mydb_rename_fn($$) {
 
   my $oldlocalname=$oldfn;
   die "not a mirrored filename\n" if $oldlocalname!~s@\A/root/+@@;
-  my $oldshortprincipal=$oldlocalname;
-  $oldshortprincipal=~s@\A.*/@@s;
-  shorten_with_ext_bang($oldshortprincipal);
-
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@;
-  my $shortprincipal=$localname;
-  $shortprincipal=~s@\A.*/@@s;
-  shorten_with_ext_bang($shortprincipal);
-  my($fs,$ino)=eval { file_localname_to_fs_ino($localname) }; # Dat: this might die()
-  return if $@; # Dat: maybe 'localname not a file' -- must exist, we've just renamed (!! Imp: avoid race condition)
 
+  my($fs,$ino)=eval { mydb_file_localname_to_fs_ino($localname,0,1) }; # Dat: this might die()
+  return if $@; # Dat: maybe 'localname not a file' -- must exist, we've just renamed (!! Imp: avoid race condition)
+  if (!defined $fs) {
+    # Dat: we don't know anything about the target filesystem yet, but the
+    #      rename(2) has already succeeded. This means `files' cannot contain
+    #      $localname, so it doesn't have to be changed, so we don't have to
+    #      do anything.
+    #db_transaction(sub {
+    #  ($fs,$ino)=mydb_file_localname_to_fs_ino($localname);
+    #  mydb_rename_fn_low($oldshortprincipal, $shortprincipal, $localname, $ino, $fs);
+    #});
+  } else {
+    # vvv Imp: don't go on if ($ino,$fs) is not known in the metadata store
+    return if !@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)};
+    
+    my $oldshortprincipal=$oldlocalname;
+    $oldshortprincipal=~s@\A.*/@@s;
+    shorten_with_ext_bang($oldshortprincipal);
+
+    my $shortprincipal=$localname;
+    $shortprincipal=~s@\A.*/@@s;
+    shorten_with_ext_bang($shortprincipal);
+    mydb_rename_fn_low(  $oldshortprincipal, $shortprincipal, $localname, $ino, $fs)
+  }
+}
+
+#** Callable even if ($ino,$fs) is not known in the metadata store.
+sub mydb_rename_fn_low($$$$$) {
+  my($oldshortprincipal, $shortprincipal, $localname, $ino, $fs)=@_;
   my $rv;
   if ($oldshortprincipal eq $shortprincipal) { # Dat: shortcut: last filename component doesn't change
-    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+    print STDERR "DB_RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
       $localname, $ino, $fs); # Dat: might have no effect
-    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
+    print STDERR "DB_RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
   } else {
     db_transaction(sub {
-      print STDERR "RENAME_FN TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-      my($shortprincipal,$shortname)=mydb_gen_shorts($localname,$fs,$ino); # Dat: this modifies the db and it might die()
+      print STDERR "DB_RENAME_FN TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+      my($shortprincipal1,$shortname1)=mydb_gen_shorts($localname,$fs,$ino); # Dat: this modifies the db and it might die()
       $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
-        $localname, $shortprincipal, $shortname, $ino, $fs); # Dat: might have no effect
-      print STDERR "RENAME_FN TO principal=($localname) shortprincipal=($shortprincipal) shortname=($shortname) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
-    });
+        $localname, $shortprincipal1, $shortname1, $ino, $fs); # Dat: might have no effect
+      print STDERR "DB_RENAME_FN TO principal=($localname) shortprincipal=($shortprincipal1) shortname=($shortname1) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
+    },1);
   }
   $rv
 }
@@ -653,8 +734,8 @@ sub mydb_op_tag($$) {
       "SELECT 1 FROM tags WHERE tag=? AND ino=0 AND fs='' LIMIT 1", $tag)};
     print STDERR "DB_OP_TAG localname=($localname) tag=($tag)\n" if $config{'verbose.level'};
     # Imp: implement file_shortname_to_fs_ino() in addition to
-    #      file_localname_to_fs_ino() to avoid extra database access
-    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    #      mydb_file_localname_to_fs_ino() to avoid extra database access
+    my($fs,$ino)=mydb_file_localname_to_fs_ino($localname); # Dat: this might die()
     print STDERR "DB_OP_TAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     mydb_ensure_fs_ino_name($fs,$ino,$localname);
     # vvv Dat: different when row already present
@@ -677,7 +758,7 @@ sub mydb_op_untag($$) {
     my $localname=mydb_fn_to_localname($fn);
     die "not pointing to a mirrored filename\n" if !defined$localname;
     print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag)\n" if $config{'verbose.level'};
-    my($fs,$ino)=file_localname_to_fs_ino($localname,1); # Dat: this might die()
+    my($fs,$ino)=mydb_file_localname_to_fs_ino($localname,1,0); # Dat: this might die()
     print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     my $rv=($tag eq ':all') ?
       db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
@@ -856,7 +937,8 @@ sub mydb_file_get_tags($) {
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
   # Dat: this is wrong if a file has multiple links:
   #      return map { $_->[0] } @{db_query_all("SELECT tag FROM tags, files WHERE principal=? AND files.ino=tags.ino AND files.fs=tags.fs ORDER BY tag",$localname)};
-  my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+  my($fs,$ino)=mydb_file_localname_to_fs_ino($localname,0,1); # Dat: this might die()
+  return () if !defined $fs;
   map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
     $ino, $fs)}
 }  
@@ -866,7 +948,8 @@ sub mydb_file_get_descr($) {
   my($fn)=@_;
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
-  my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+  my($fs,$ino)=mydb_file_localname_to_fs_ino($localname,0,1); # Dat: this might die()
+  return undef if !defined $fs;
   my $L=db_query_all("SELECT descr FROM files WHERE ino=? AND fs=? LIMIT 1",
     $ino, $fs);
   @$L ? $L->[0][0] : undef
@@ -882,7 +965,7 @@ sub mydb_file_set_descr($$) {
   $descr=~s@\A\s+@@;
   print STDERR "DB_FILE_SET_DESCR localname=($localname) descr=($descr)\n" if $config{'verbose.level'};
   db_transaction(sub {
-    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    my($fs,$ino)=mydb_file_localname_to_fs_ino($localname); # Dat: this might die()
     mydb_ensure_fs_ino_name($fs,$ino,$localname);
     # vvv Dat: we could do this with `WHERE fs=? AND ino=?'
     my $rv=db_do("UPDATE files SET descr=? WHERE ino=? AND fs=?", $descr, $ino, $fs);
@@ -900,7 +983,7 @@ sub mydb_file_set_tagtxt($$) {
   db_transaction(sub {
     print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags)\n" if $config{'verbose.level'};
     # vvv Dat: similar to mydb_file_get_tags()
-    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    my($fs,$ino)=mydb_file_localname_to_fs_ino($localname); # Dat: this might die()
     # vvv Dat: works even if `fs--ino' is missing from `files'
     my @old_tags=map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
       $ino, $fs)};
@@ -917,7 +1000,7 @@ sub mydb_file_set_tagtxt($$) {
           for my $tag (@tags) { die "unknown tag: $tag\n" if !defined $all_tags{$tag} }
         }
         # Imp: implement file_shortname_to_fs_ino() in addition to
-        #      file_localname_to_fs_ino() to avoid extra database access
+        #      mydb_file_localname_to_fs_ino() to avoid extra database access
         print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
         mydb_ensure_fs_ino_name($fs,$ino,$localname);
         ## vvv Dat: different when row already present
@@ -947,19 +1030,21 @@ sub mydb_unlink_last($$$) {
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
   print STDERR "DB_UNLINK_LAST localname=($localname)\n" if $config{'verbose.level'};
-  # vvv Dat: too late, deleted.
-  my($fs,$ino)=file_st_to_fs_ino($st_dev,$st_ino); # Dat: this might die()
-  if (@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
-    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-    db_transaction(sub {
-      my $rv1=db_do(   "DELETE FROM files WHERE ino=? AND fs=?", $ino, $fs);
-      my $rv2=db_do(    "DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs);
-      my $rv3=db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
-      print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) rv=$rv1+$rv2+$rv3\n" if $config{'verbose.level'};
-    });
-  } else {
-    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) not-in-files\n" if $config{'verbose.level'};
-  }
+  db_transaction(sub {
+    # vvv Dat: too late to lstat(2), already deleted.
+    my($fs,$ino)=mydb_file_st_to_fs_ino($st_dev,$st_ino); # Dat: this might die()
+    if (@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+      print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+      #db_transaction(sub {
+        my $rv1=db_do(   "DELETE FROM files WHERE ino=? AND fs=?", $ino, $fs);
+        my $rv2=db_do(    "DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs);
+        my $rv3=db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
+        print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) rv=$rv1+$rv2+$rv3\n" if $config{'verbose.level'};
+      #});
+    } else {
+      print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) not-in-files\n" if $config{'verbose.level'};
+    }
+  });
 }
 
 #** Converts empty string to empty string, newline to ="\012" etc,
@@ -1451,6 +1536,11 @@ sub my_mkdir($$) {
       return diemsg_to_nerrno();
       # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
       #          and return Errno::ENOENT to the application.
+    } elsif ($fn eq '/adm/reload_fss') {
+      eval { mydb_fill_dev_to_fs; };
+      return diemsg_to_nerrno();
+      # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
+      #          and return Errno::ENOENT to the application.
     } elsif ($fn eq '/adm/purgeallmeta') {
       return -1*Errno::EOPNOTSUPP if !$config{'enable.purgeallmeta.p'};
       eval { mydb_purgeallmeta(); };
@@ -1765,16 +1855,17 @@ if ((@L or $! !=Errno::ENOTCONN) and !(-d _)) {
 $config{'root.prefix'}=~s@//+@/@g;
 $config{'root.prefix'}=~s@/*\Z(?!\n)@/@;
 $config{'root.prefix'}=~s@\A/+@/@;
-$all_fs=config_get('default.fs','F'); # !!
-{ my @st=lstat("$config{'root.prefix'}/.");
-  die "$0: cannot stat --root-prefix=: $config{'root.prefix'}\n" if !@st;
-  $all_dev=$st[0];
-  #die "all_dev=$all_dev\n";
-}
+#$all_fs=config_get('default.fs','F');
+#{ my @st=lstat("$config{'root.prefix'}/.");
+#  die "$0: cannot stat --root-prefix=: $config{'root.prefix'}\n" if !@st;
+#  $all_dev=$st[0];
+#  #die "all_dev=$all_dev\n";
+#}
 db_connect();
+mydb_fill_dev_to_fs();
 
 system('fusermount -u -- '.fnq($config{'mount.point'}).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts
-print STDERR "starting Fuse::main on mount.point=$config{'mount.point'}\n" if $config{'verbose.level'};
+print STDERR "movemetafs v$VERSION server, starting Fuse::main on mount.point=$config{'mount.point'}\n" if $config{'verbose.level'};
 print STDERR "Press Ctrl-<C> to exit (and then umount manually).\n" if $config{'verbose.level'};
 # vvv Dat: it is also OK to use "Fuse::Demo::my_getattr" instead of
 #     \&my_getattr, but now it is more typesafe.
