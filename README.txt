@@ -45,12 +45,12 @@ Features of movemetafs:
    the tags associated to a file.
 -- Use POSIX extended attributes to get and set the textual description of
    a file.
--- use versatile search query syntax (MySQL fulltext search) with the
+-- Use versatile search query syntax (MySQL fulltext search) with the
    possiblity of boolean search (i.e. searching for files matching a
-   combination of tags)
--- copy search results to make backups or to create collections
--- attach textual descriptions to files, and read the description once the
-   file is found
+   combination of tags).
+-- Copy search results to make backups or to create collections.
+-- Attach textual descriptions to files, and read the description once the
+   file is found.
 -- Searching is fast, because it uses a fulltext index.
 -- After installation, movemetafs can be used on an existing filesystem
    instantly: there is no migration needed to make an existing filesystem usable with
@@ -69,6 +69,10 @@ Features of movemetafs:
    middle of the filename.
 -- Uses UTF-8 for tag names and descriptions.
 -- Filenames in search results are automatically made unique when necessary.
+-- Following the Unix filesystem design, files with multiple hard links
+   share a commond description and a common set of tags. If tags or
+   the description are changed on one name, the changes also apply to other
+   names, too.
 
 Current limitations:
 
@@ -97,6 +101,8 @@ Current limitations:
 -- For files with multiple (hard) links, symlinks in search results point to
    only one of filenames (usually the oldest) -- the other filenames are not
    stored by movemetafs.
+-- For files with multiple (hard) links, the principal name cannot be
+   removed. (But it can be changed.)
 -- it is not totally convenient to remove the principal instance of a tagged
    file with multiple hard links
 -- POSIX extended attributes and ACLs are not mirrorred
@@ -315,6 +321,21 @@ mmfs_fuse.pl dies, you have to unmount the meta filesystem with `fusermount
 -u /path/to/meta' before mounting it again. All these operations can be done
 as a regular user (root is not necessary).
 
+The folders of the meta filesystem are designed to be as intuitive as
+possible:
+
+-- Use `meta/root' to browse (or even modify) the carrier filesystem.
+   Be careful to do write operations here (and not on the carrier directly,
+   even when the meta filesystem is not mounted).
+-- Use `meta/tag' to add and remove tags.
+-- Move a file to `meta/tag/$TAGNAME' to add a tag to it.
+-- Move a file to `meta/untag/$TAGNAME' to remove a tag from it.
+-- Use `meta/tagged' to list files associated to a particular tag, and
+   the tag from some of those files.
+-- Use `meta/search' to search for files matching one or more tags
+   (all of them, any of them, or a combination of them -- the full power
+   of MySQL boolean fulltext search is at your disposal).
+
 After starting mmfs_fuse.pl, the writable mirror view of the carrier
 filesystem (--root-prefix=) becomes available as meta/root, with the
 following limitations:
@@ -337,15 +358,20 @@ following limitations:
 
 Special operations with files in meta/root:
 
--- If a file is moved (or, equivalently, renamed) inside meta/root, its
+-- (Safe only in meta filesystem.)
+   If a file is moved (or, equivalently, renamed) inside meta/root, its
    principal name is changed to the new name. Most of the files have link
    count of 1, thus this should be the correct behaviour. Renaming can be
    used to deliberately change the principal name of a file with multiple
    hard links. See also ``Principal name''.
--- If a file has multiple hard links, its principal name is not allowed
+-- (Safe only in meta filesystem.)
+   If a file has multiple hard links, its principal name is not allowed
    to be removed (Operation not permitted, EPERM). This a a safety feature
    that prevents the `files.principal' column getting stale. See more
    in ``Principal name''.
+-- (Safe only in meta filesystem.)
+   If a last link to a file is removed (or a folder is removed), movemetafs
+   removes all tags associated with it and its description.
 -- `getfattr -d -e text meta/root/.../$FILENAME' displays all tags
    associated with the file in the `user.tags' attribute (sorted and joined
    by a single space) and the file's description in the `user.description'
@@ -374,23 +400,18 @@ Special operations with files in meta/root:
    and new values are the same, and returns `Operation not permitted'
    otherwise.
 
+Some of the operations above are markes with `Safe only in meta filesystem.'
+This means that these operations should not be performed on the carrier
+filesystem directly (even when the meta filesystem is not mounted) on files
+having tags or a nonempty description. That's because these operations they
+might cause a mismatch between the files and their metadata if performed
+on the carrier filesystem without the meta filesystem being notified.
+
 Besides `meta/root', there are also some special folders ain `meta/', which
 behave quite differently from regular filesystems. Permissions and
 ownerships in these folders don't matter. Files on the carrier are not
 accessible form special folders (except through symlinks pointing inside
 `meta/root').
-
-The folders are designed to be as intuitive as possible:
-
--- Use `meta/root' to browse (or even modify) the carrier filesystem.
--- Use `meta/tag' to add and remove tags.
--- Move a file to `meta/tag/$TAGNAME' to add a tag to it.
--- Move a file to `meta/untag/$TAGNAME' to remove a tag from it.
--- Use `meta/tagged' to list files associated to a particular tag, and
-   the tag from some of those files.
--- Use `meta/search' to search for files matching one or more tags
-   (all of them, any of them, or a combination of them -- the full power
-   of MySQL boolean fulltext search is at your disposal).
 
 Special folders are:
 
@@ -731,10 +752,16 @@ possible, and send your report in e-mail to Péter Szabó <pts@fazekas.hu>.
 
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
-!! doc: example session with shell command lines
-!! feature: setxattr on user.tags and user.description
-!! feature: empty meta/tag/$TAGNAME and meta/untag/$TAGNAME folders,
-   list files in meta/tagged/$TAGNAME
+!! rethink: prepending :%x:%s: to short names ruins their sort order
+!! feature: multiple filesystem support based on UUID (this would survive
+   migration quite easily)
+!! feature: retain tags and description when file is copied (RELEASE op.)
+!! feature: link files together: if tags or description change in one file,
+   automatically change on the other, too. Possibly do this automatically on
+   a copy. Or should we add a ``parent inode pointer''? That would make it
+   problematic query in multiple levels.
+!! doc: how to migrate
+!! doc: example session with shell command lines earlier
 !! doc: qiv-command `mv' support
 !! feature: import tags from ~/.gqview/metadata/home/you/foo.jpg.meta
 !! feature: patch GQview to use us (setxattr) instead of ~/.gqview/metadata
@@ -847,6 +874,8 @@ Improvement possibilites
 !! feature: fulltext search on descriptions
 !! feature: edit extended attributes in Midnight Commander
 !! test suite
+!! feature: remove stale files
+!! feature: keep metadata after file has been removed
 !! feature: SYMLINK(../../root/proba/b,/root/proba/c/b)
    <- mv /tmp/mp/tagged/food/b /tmp/mp/root/proba/c
 !! .qiv_trash symlink exists...: (but allows deletion from .qiv-trash)

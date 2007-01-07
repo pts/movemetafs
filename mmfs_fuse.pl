@@ -377,14 +377,23 @@ sub verify_localname($) {
     substr($localname,-1)eq'/' or index($localname,'//')>=0;
 }
 
+#** Dat: change this to have multiple filesystem support
 #** @return ($fs,$ino)
-sub file_localname_to_fs_ino($) {
-  my($localname)=@_;
+sub file_localname_to_fs_ino($;$) {
+  my($localname,$allow_nonfile_p)=@_;
   my @st;
   die "localname not found\n" unless @st=lstat($root_prefix.$localname);
-  die "localname not a file\n" if !-f _;
+  die "localname not a file\n" if !$allow_nonfile_p and !-f _;
   die "localname on different filesystem\n" if $st[0] ne $all_dev;
   ($all_fs,$st[1]) # Imp: better than $all_fs
+}
+
+#** Dat: change this to have multiple filesystem support
+sub file_st_to_fs_ino($$) {
+  my($st_dev,$st_ino)=@_;
+  #die "localname not a file\n" if !$allow_nonfile_p and !-f _;
+  die "localname on different filesystem\n" if $st_dev ne $all_dev;
+  ($all_fs,$st_ino) # Imp: better than $all_fs
 }
 
 #** Doesn't do any insert if ($fs,$ino) already exists in `files'.
@@ -537,7 +546,7 @@ sub mydb_op_untag($$) {
     my $localname=mydb_fn_to_localname($fn);
     die "not pointing to a mirrored filename\n" if !defined$localname;
     print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag)\n" if $DEBUG;
-    my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
+    my($fs,$ino)=file_localname_to_fs_ino($localname,1); # Dat: this might die()
     print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
     my $rv=($tag eq ':all') ?
       db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
@@ -795,6 +804,32 @@ sub mydb_file_set_tagtxt($$) {
   });
 }
 
+#** Is unlink OK if $fn has multiple hard links?
+sub mydb_may_unlink_multi() {
+  my($fn)=@_;
+  !mydb_fn_is_principal($fn)
+}
+
+#** Unlinks the last hard link of the file from the database.
+sub mydb_unlink_last($$$) {
+  my($fn,$st_dev,$st_ino)=@_;
+  my $localname=$fn;
+  die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  print STDERR "DB_UNLINK_LAST localname=($localname)\n" if $DEBUG;
+  # vvv Dat: too late, deleted.
+  my($fs,$ino)=file_st_to_fs_ino($st_dev,$st_ino); # Dat: this might die()
+  if (@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs)\n" if $DEBUG;
+    db_transaction(sub {
+      my $rv1=db_do(   "DELETE FROM files WHERE ino=? AND fs=?", $ino, $fs);
+      my $rv2=db_do(    "DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs);
+      my $rv3=db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
+      print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) rv=$rv1+$rv2+$rv3\n" if $DEBUG;
+    });
+  } else {
+    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) not-in-files\n" if $DEBUG;
+  }
+}
 
 #die $dbh->{AutoCommit};
 #db_connect()->begin_work();
@@ -1121,12 +1156,22 @@ sub my_unlink($) {
     }
     return -1*Errno::EPERM
   } else {
-    my($dev,$ino,$mode,$nlink)=lstat($real);
-    if (defined $nlink and $nlink>1) {
-      # ^^^ Dat: this check has a race condition only 
-      return -1*Errno::EPERM if mydb_fn_is_principal($fn);
+    my($st_dev,$st_ino,$st_mode,$st_nlink)=lstat($real);
+    if (defined $st_nlink and $st_nlink>1) {
+      # ^^^ Dat: this check has a race condition only
+      my $may_p=eval { mydb_unlink_multi($fn) };
+      return diemsg_to_nerrno() if $@;
+      return -1*Errno::EPERM if !$may_p;
     }
     return -1*$! if !unlink($real);
+    if (defined $st_nlink and $st_nlink==1) {
+      # Dat: when the last (hard) link of a file is removed, remove the file
+      #      from the metadata store
+      eval { mydb_unlink_last($fn,$st_dev,$st_ino) };
+      # vvv Dat: always succeed if remove succeeds
+      #return diemsg_to_nerrno()
+      print STDERR "info: error: $@" if $@;
+    }
   }
   return 0
 }
@@ -1142,9 +1187,17 @@ sub my_rmdir($) {
       return diemsg_to_nerrno();
     }
     return -1*Errno::EPERM
-  } elsif (!rmdir($real)) {
-    return -1*$!
   } else {
+    my($st_dev,$st_ino)=lstat($real);
+    if (!defined($st_ino) or !rmdir($real)) {
+      return -1*$!
+    } else { # Dat: no need to test for $st_nlink (>=2)
+      # Imp: test this
+      eval { mydb_unlink_last($fn,$st_dev,$st_ino) };
+      # vvv Dat: always succeed if remove succeeds
+      #return diemsg_to_nerrno()
+      print STDERR "info: error: $@" if $@;
+    }
     return 0
   }
 }
@@ -1441,7 +1494,7 @@ sub my_removexattr($$) {
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
     elsif ($ARGV[$I] eq '--version') {
-      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.11 2007-01-06 22:46:05 pts Exp $'."\n";
+      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.12 2007-01-07 00:00:05 pts Exp $'."\n";
       print STDERR "by Pe'ter Szabo' since early January 2007\n";
       print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
       exit 0
