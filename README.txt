@@ -268,7 +268,7 @@ Description: Each file has a textual description associated with it, which
 can be used to add additional information (such as the story depicted on the
 media file or the story of the file creation itself). The description is not
 stored on the real filesytem, but in the MySQL database. The
-description can be read and written using the `user.description' POSIX
+description can be read and written using the `mmfs.description' POSIX
 extended attribute. Each file has an empty description by default. The
 maximum description length is 65535 bytes (because setfattr(1) cannot pass
 longer POSIX extended attributes to FUSE Perl scripts -- the limit on the
@@ -294,7 +294,7 @@ including "\0" are allowed. To add a description containing "\0", create
 an attribute dump file attr_dump:
 
   # file: meta/root/dir/file
-  user.description="a\000\142"
+  mmfs.description="a\000\142"
 
 Then restore the dump:
 
@@ -304,7 +304,7 @@ You can verify that all 3 bytes are present:
 
   $ getfattr -d -e text -- meta/root/dir/file
   # file: meta/root/dir/file
-  user.description="a\000b"
+  mmfs.description="a\000b"
 
 How to use
 ~~~~~~~~~~
@@ -386,30 +386,30 @@ Special operations with files in meta/root:
    If a last link to a file is removed (or a folder is removed), movemetafs
    removes all tags associated with it and its description.
 -- `getfattr -d -e text meta/root/.../$FILENAME' displays all tags
-   associated with the file in the `user.tags' attribute (sorted and joined
-   by a single space) and the file's description in the `user.description'
-   attribute. If no tags are associated with the file, `user.tags' is empty.
-   If no description has been set for the file, `user.description' is empty.
+   associated with the file in the `mmfs.tags' attribute (sorted and joined
+   by a single space) and the file's description in the `mmfs.description'
+   attribute. If no tags are associated with the file, `mmfs.tags' is empty.
+   If no description has been set for the file, `mmfs.description' is empty.
 
    Each file (and other node) in `meta/root' (but not `meta/root' itself)
-   has the attribute `user.realnode' with value `1'. All other nodes have
-   the attribute `user.fakenode' with value `1'.
--- `setfattr -n user.tags -v "$TAGS" $meta/root/.../$FILENAME' can be used
+   has the attribute `mmfs.realnode' with value `1'. All other nodes have
+   the attribute `mmfs.fakenode' with value `1'.
+-- `setfattr -n mmfs.tags -v "$TAGS" $meta/root/.../$FILENAME' can be used
    to set the tags associated with the file. All tags specified in the
    whitespace-separated tag list $TAGS get added to $FILENAME, and all
    other tags get removed from it. Please note that if $TAGS is
-   empty, you have to omit `-v'. Using `user.tags' is not the recommended
+   empty, you have to omit `-v'. Using `mmfs.tags' is not the recommended
    method of adding tags (because it might also remove tags); to add tags,
    move the file from `meta/root/...' to `meta/tag/$TAGNAME/'.
--- `setfattr -n user.description -v "$DESCRIPTION" $meta/root/.../$FILENAME'
+-- `setfattr -n mmfs.description -v "$DESCRIPTION" $meta/root/.../$FILENAME'
    can be used to set the file's description to $DESCRIPTION. Please note
    that $DESCRIPTION must be specified in UTF-8. Please note that if
    $DESCRIPTION is empty, you have to omit the `-v' option of `setfattr'.
 -- POSIX extended attributes cannot be removed (e.g. with `setfattr -x')
    in the meta filesystem. An attempt to remove an attribute is equivalent
    to setting its value to the empty string.
--- Attributes cannot be modified, except for `user.description' and
-   `user.tags'. An attempt to modify another attribute succeeds if the old
+-- Attributes cannot be modified, except for `mmfs.description' and
+   `mmfs.tags'. An attempt to modify another attribute succeeds if the old
    and new values are the same, and returns `Operation not permitted'
    otherwise.
 
@@ -765,6 +765,7 @@ possible, and send your report in e-mail to Péter Szabó <pts@fazekas.hu>.
 
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
+!! feature: add values to tags, e.g. `user.foo="bar"' for tag `foo'.
 !! rethink: prepending :%x:%s: to short names ruins their sort order
 !! feature: multiple filesystem support based on UUID (this would survive
    migration quite easily)
@@ -909,6 +910,5 @@ Improvement possibilites
     READ(/root/proba/minishot.jpg,16384,0)
     FLUSH(/root/proba/minishot.jpg)
     RELEASE(/root/proba/minishot.jpg)
-
 
 __END__
