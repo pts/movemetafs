@@ -20,11 +20,13 @@ movemetafs is similar to LAFS (http://junk.nocrew.org/~stefan/lafs/)
 (not tagji 1.1 by Manuel Arriaga). Most important differences:
 
 -- movemetafs uses MySQL instead of PostgreSQL (benefits: speedup, easier
-   installation with pts-mysql-local)
--- movemetafs doesn't require files to be explicitly added
--- movemetafs cannot list all untagged files quickly
+   installation with pts-mysql-local).
+-- movemetafs doesn't require files to be explicitly added.
+-- movemetafs cannot list all untagged files quickly.
 -- movemetafs is written in Perl, so it is quite easy to extend and try
-   out new features
+   out new features.
+-- movemetafs continues to work when files are renamed.
+-- movemetafs works with files with more than one hard link.
 
 Features of movemetafs:
 
@@ -43,14 +45,18 @@ Features of movemetafs:
    `meta/tagged/$TAGNAME/$FILENAME'.
 -- Alternatively, use POSIX extended attributes to retrieve (or even set)
    the tags associated to a file.
+-- Attach textual descriptions to files, and read the description once the
+   file is found.
 -- Use POSIX extended attributes to get and set the textual description of
    a file.
+-- Create a recursive POSIX extended attribute dump (of tags and
+   descriptions) from the database very quickly.
+-- Restore the created POSIX extended attribute dump with
+   `setfattr --restore'.
 -- Use versatile search query syntax (MySQL fulltext search) with the
    possiblity of boolean search (i.e. searching for files matching a
    combination of tags).
 -- Copy search results to make backups or to create collections.
--- Attach textual descriptions to files, and read the description once the
-   file is found.
 -- Searching is fast, because it uses a fulltext index.
 -- After installation, movemetafs can be used on an existing filesystem
    instantly: there is no migration needed to make an existing filesystem usable with
@@ -274,12 +280,12 @@ filesystem), movemetafs forgets all associated tags permanently.
 Principal name: Files with multiple hard links share the same set of tags.
 Such a tagged file has a principal name (which is returned in symlinks in
 search results, and which was assigned the file was first tagged, or later,
-when it was last renamed). For safety reasons, movemetafs gives the EPERM
-error when you attempt to remove (unlink) the principal name of a file with
-multiple hard links. To remove such a name A, locate another name B first
-(might involve a slow find(1) with `-inum ...'), rename the other name B (to
-B1), rename B1 back to B (thus making B the principal name of the file),
-then remove A.
+when it was last renamed). For safety (and operability) reasons, movemetafs
+gives the EPERM error when you attempt to remove (unlink) the principal name
+of a file with multiple hard links. To remove such a name A, locate another
+name B first (might involve a slow find(1) with `-inum ...' on the carrier),
+move B to `meta/adm/fixprincipal', then remove A. (Alternatively of moving
+B, you can rename B to B1, and rename B1 back to B.)
 
 Short name: each tagged file has a short name, which is displayed as the
 name of the symlink in search results. The short name is generated from the
@@ -302,7 +308,7 @@ Description: Each file has a textual description associated with it, which
 can be used to add additional information (such as the story depicted on the
 media file or the story of the file creation itself). The description is not
 stored on the real filesytem, but in the MySQL database. The
-description can be read and written using the `mmfs.description' POSIX
+description can be read and written using the `user.mmfs.description' POSIX
 extended attribute. Each file has an empty description by default. The
 maximum description length is 65535 bytes (because setfattr(1) cannot pass
 longer POSIX extended attributes to FUSE Perl scripts -- the limit on the
@@ -328,7 +334,7 @@ including "\0" are allowed. To add a description containing "\0", create
 an attribute dump file attr_dump:
 
   # file: meta/root/dir/file
-  mmfs.description="a\000\142"
+  user.mmfs.description="a\000\142"
 
 Then restore the dump:
 
@@ -338,36 +344,81 @@ You can verify that all 3 bytes are present:
 
   $ getfattr -d -e text -- meta/root/dir/file
   # file: meta/root/dir/file
-  mmfs.description="a\000b"
+  user.mmfs.description="a\000b"
 
 Startup configuration
 ~~~~~~~~~~~~~~~~~~~~~
-`mmfs_fuse.pl' is the user-level process that provides the meta filesystem.
-All !!
+movemetafs can be configured using command-line options and/or configuration
+file entries. The configuration file is `movemetafs.conf' in the folder
+`mmfs_fuse.p'l is started (except when the
+`--config-file=<file>' command-line option is present). No other search is
+done for the configuration file.
 
-After installation, mount the meta filesystem by running mmfs_fuse.pl
-with the appropriate command-line arguments. Usually it is enough to
-specify --root-prefix= and --mount-point=. If necessary, specify --quiet.
+Configuration entries are key--value pairs. Keys are case
+sensitive. The characters `-' and `_' are converted to `.' in keys when the
+configuration entry is read. Leading and trailing whitespaces are ignored in
+lines. A line starting with a `#' (possibly after whitespace) is ignored.
+Other lines must be in the form `<key>=<value>' or `<key>="<quoted-value>"'.
+Whitespace around `=' is ignored. `:' is also accepted in place of `='.
+Quoted values are like C string, the following escapes are recognized:
+\000 .. \377 (octal), \n, \t, \f, \b (backspace), \a, \e, \v and \r.
+Escaping other characters is also OK (e.g. `\\' and `\"'). Example entries:
 
-The most important options for mmfs_fuse.pl:
+  newline = "\n"
+  db.auth =  a password with four spaces
+  db.auth = ""
+  # Cannot put this comment at the end of the previous line.
 
--- --config-file=<file>
--- --version
--- --help
--- --test-db
--- --root-prefix=<dir>: the carrier filesystem folder, this will be
-   visible as `meta/root'. This option is recommended (default: current
-   directory of the ./mmfs_fuse.pl program invocation). You may
-   have to create this folder manually before starting mmfs_fuse.pl.
--- --mount-point=<dir>: folder writable by you to which the meta
-   filesystem is mounted, i.e. `meta/root' will be `<dir>/root'. This option
-   is mandatory.
--- --quiet: specify it to suppress debug messages and speed up mmfs_mount.pl
-   a little bit.
+Configuration entries can be specified in the command-line, too, prefixed by
+`--'. For example, `--db-auth=my_password'. Entries specified in the command
+line override those in the configuration file. Some command-line options
+have no equivalent in the configuration file:
 
-Please remember the command-line options (especially --root-prefix=),
-because finding tagged files might not work if some crucial options are
-different when remounting it later.
+-- --config-file=<file>: set configuration file name
+-- --version: print movemetafs version number (and some messages) and exit
+-- --help: print (the lack of) help and exit
+-- --test-db: perform some simple tests on the database (can we connect? do
+   we have all the tables with all the necessary fields? can we make
+   modifications?)
+-- --quiet: decrease the value of `verbose.level' by 1
+-- --verbose: increase the value of `verbose.level' by 1
+
+Usually there is no need to override the defaults entries, except for
+the database connection parameters (`db.*'), most importantly `db.dsn'.
+Other useful entries are `verbose.level' and `root.prefix'.
+
+The most important configuration entries for movemetafs:
+
+-- db.dsn (mandatory, no default): Perl DBI data source name pointing to the
+   MySQL server. See more in `perldoc DBD::mysql'.
+-- db.username (default: `root'): MySQL user name (usually `movemetafs_rw').
+-- db.auth (default: empty): MySQL user password.
+-- db.onconnect.1 ... db.onconnect.9 (default: missing): SQL statements to
+   be executed upon connecting to the database. Usuually none.
+-- default.fs (default: `F'): default value to be put to the `fs' columns of
+   various tables. Has only historical significance. Should be quite short.
+-- read.only.p (default: `0'): a boolean; if true, the meta filesystem
+   becomes read-only.
+-- enable.purgeallmeta.p (default: `0'): a boolean; if true, the dangerous
+   `meta/adm/prugeallmeta' functionality is enabled. This is dangerous,
+   because it can be used to purge all tags and descriptions ever known
+   in one step, without confirmation.
+-- verbose.level (default: `1'): integer; controls the amount of debug
+   messages printed by `mmfs_fuse.pl'. Use `1' to get all the
+   debug messages, use `0' to suppress most (and make operation a little
+   faster).
+-- mount.point (mandatory, no default): folder writable by you to which the
+   meta filesystem is mounted, i.e. `meta/root' will be `<dir>/root' if
+   `mount.point=<dir>'. You may have to create this folder manually before
+   starting `mmfs_fuse.pl'. Because of how FUSE works, other users on
+   the system (`root' included) won't be able to see into this folder once the
+   meta filesystem is mounted.
+-- root.prefix (mandatory, empty): the carrier filesystem folder, this will
+   be visible as `meta/root'. Can be absolute or relative (to the current
+   folder of the `mmfs_fuse.pl' program invocation).
+
+To find out more configuration entries, please read `mmfs_fuse.pl'
+(search for `%config_default' and `config_process_option').
 
 How to use
 ~~~~~~~~~~
@@ -382,6 +433,10 @@ Startup steps:
    root.
 5. Start `mmfs_fuse.pl' with the appropriate configuration, as documented in
    the section ``Startup configuration''. This mounts the meta filesystem.
+
+   Please remember the command-line options (especially --root-prefix=),
+   because finding tagged files might not work if some crucial options are
+   different when remounting it later.
 
 The `mmfs_fuse.pl' script should remain running while you want to access the
 filesystem, so it is recommended to start the script inside screen(1). If
@@ -441,30 +496,37 @@ Special operations with files in meta/root:
    If a last link to a file is removed (or a folder is removed), movemetafs
    removes all tags associated with it and its description.
 -- `getfattr -d -e text meta/root/.../$FILENAME' displays all tags
-   associated with the file in the `mmfs.tags' attribute (sorted and joined
-   by a single space) and the file's description in the `mmfs.description'
-   attribute. If no tags are associated with the file, `mmfs.tags' is empty.
-   If no description has been set for the file, `mmfs.description' is empty.
+   associated with the file in the `user.mmfs.tags' attribute (sorted and joined
+   by a single space) and the file's description in the `user.mmfs.description'
+   attribute. If no tags are associated with the file, `user.mmfs.tags' is empty.
+   If no description has been set for the file, `user.mmfs.description' is empty.
 
    Each file (and other node) in `meta/root' (but not `meta/root' itself)
-   has the attribute `mmfs.realnode' with value `1'. All other nodes have
-   the attribute `mmfs.fakenode' with value `1'.
--- `setfattr -n mmfs.tags -v "$TAGS" $meta/root/.../$FILENAME' can be used
+   has the attribute `user.mmfs.realnode' with value `1'. All other nodes have
+   the attribute `user.mmfs.fakenode' with value `1'.
+-- `setfattr -n user.mmfs.tags -v "$TAGS" $meta/root/.../$FILENAME' can be used
    to set the tags associated with the file. All tags specified in the
    whitespace-separated tag list $TAGS get added to $FILENAME, and all
-   other tags get removed from it. Please note that if $TAGS is
-   empty, you have to omit `-v'. Using `mmfs.tags' is not the recommended
-   method of adding tags (because it might also remove tags); to add tags,
-   move the file from `meta/root/...' to `meta/tag/$TAGNAME/'.
--- `setfattr -n mmfs.description -v "$DESCRIPTION" $meta/root/.../$FILENAME'
+   other tags get removed from it. If $TAGS is
+   empty, you have to omit `-v'.
+   
+   Please note that it is not possible add unknown tags via
+   `user.mmfs.tags' (`Cannot assign requested address' will be reported).
+   However, it is possible to bulk add tags using
+   `meta/adm/addtags', and using `setfattr --restore' after that.
+   
+   Using `user.mmfs.tags' is not the recommended method of adding tags to a
+   file (because it might also remove tags); to do so, move the file from
+   `meta/root/...' to `meta/tag/$TAGNAME/'.
+-- `setfattr -n user.mmfs.description -v "$DESCRIPTION" $meta/root/.../$FILENAME'
    can be used to set the file's description to $DESCRIPTION. Please note
    that $DESCRIPTION must be specified in UTF-8. Please note that if
    $DESCRIPTION is empty, you have to omit the `-v' option of `setfattr'.
 -- POSIX extended attributes cannot be removed (e.g. with `setfattr -x')
    in the meta filesystem. An attempt to remove an attribute is equivalent
    to setting its value to the empty string.
--- Attributes cannot be modified, except for `mmfs.description' and
-   `mmfs.tags'. An attempt to modify another attribute succeeds if the old
+-- Attributes cannot be modified, except for `user.mmfs.description' and
+   `user.mmfs.tags'. An attempt to modify another attribute succeeds if the old
    and new values are the same, and returns `Operation not permitted'
    otherwise.
 
@@ -608,7 +670,7 @@ Special folders are:
       `meta/tag/$TAGNAME' uses the table `tags'. Should any mismatch arise,
       `mkdir meta/repair_taggings' regenerates `taggings' from `tags'.
 -- meta/adm
-   -- The folder `meta/adm' appears to be empty.
+   -- The folder `meta/adm' appears to contain a few empty folders.
    -- `meta/adm' can be used to issue administrative and recovery commands
       to movemetafs.
    -- If the folder `meta/adm/repair_taggings' is attempted to be created,
@@ -617,7 +679,80 @@ Special folders are:
       regeneration can be quite slow, since the time needed is proprtional
       to the number of tags in the system (with multiplicity for each file
       they are associted to).
-   -- All other write operations fail with `Operation not permitted'.
+   -- The folder `meta/adm/fixprincipal' appears to be empty. If a file
+      is moved here from `meta/root', the file is kept on its original
+      place, but the principal name (of its inode) is changed to the
+      the source name in the rename. This is a useful operation when a
+      tagged file is somehow lost (for example, it has been renamed directly
+      on the carrier filesystem), or if it is desired to change the
+      principal name of a tagged file with multiple hard links. Read more
+      in ``Principal name''.
+   -- `meta/adm/purgeallmeta' is a missing directory. When it is attempted
+      to be created, all tags and descriptions in the metadata store are
+      permanently erased (and `No such file or directory' is returned).
+      That is, the tables `files', `tags' and `taggings' are
+      truncated to zero. This is a very dangerous operation, and it is
+      disabled by default, unless the `enable.purgeallmeta.p' configuration
+      entry is set to true (e.g. `1'). `meta/adm/purgeallmeta' can be useful
+      just before a recursive attribute restore (`setfattr --restore').
+   -- `meta/adm/dumpattr' is a missing file. If a file
+      is moved over it from `meta/root', the file is kept in its original
+      place, but its contents will be overwritten by a POSIX extended
+      attribute dump file, which contains all files with tags and
+      descriptions known in the movemetafs metadata store. Only metadata
+      attributes managed by movemetafs are dumped (i.e.
+      `user.mmfs.description' and `user.mmfs.tags'). This is a
+      reasonably fast operation, because only the database is consulted
+      (the carrier filesystem isn't).
+      
+      Example for dumping:
+      
+        $ touch meta/root/user.mmfs.dump
+        $ mv meta/root/user.mmfs.dump meta/adm/dumpattr
+      
+      Dumping is almost equivalently to:
+      
+        $ (cd meta/root; getfattr -R -d -e text . >user.mmfs.dump)
+        
+      Important differences between `getfattr -R' and `meta/adm/dumpattr':
+      
+      -- `getfattr -R' examines all files recursively, `meta/adm/dumpattr'
+         examines only the metadata database, which contain only tagged
+         files (and files with nonempty description). Thus `getfattr -R' is
+         much slower.
+      -- `getfattr -R' dumps the unnecessary `user.mmfs.realnode' attribute,
+         `meta/adm/dumpattr' doesn't.
+      -- The two dump methods quote non-ASCII and non-printable characters
+         differently, `meta/adm/dumpattr' is more careful.
+      
+      Example of restoring the dump:
+
+        $ mv meta/root/user.mmfs.dump meta/adm/addtags      
+        $ (cd meta/root; setfattr --restore=user.mmfs.dump)
+        
+      Please note that restoring is much slower (about a factor of 100??)
+      than dumping.
+        
+      Dumping can be used to migrate the filesystem between machines and
+      filesystems. Read more about migration in the section ``Migration''.
+      
+      Dumping and restoring are locale-independent operations.
+      in ``Principal name''.
+   -- `meta/adm/addtags' is a missing file. If a file
+      is moved over it from `meta/root', the file is kept in its original
+      place, but all tags it contains would be added (like
+      `mkdir meta/tag/$TAGNAME'). This is useful before restoring a
+      POSIX extended attribute dump (otherwise setfattr(1) will report
+      `Cannot assign requested address').
+      
+      Each line of the file is processed separately. Lines starting with `#'
+      (possibly preceded by whitespace) are ignored. If the line starts with
+      `user.mmfs.tags="', it is treated as a `getfattr -d -e text' dump
+      line, otherwise the line is treated as a whitespace-separated list of
+      tags. Lines with syntax error are reported to STDERR (of mmfs_fuse.pl)
+      and are ignored.
+   -- All other write operations in `meta/adm'
+      fail with `Operation not permitted'.
 
 If you get `Transport endpoint is not connected' for a file operation in
 meta/, this means mmfs_fuse.pl has crashed. This usually means there is a
@@ -717,6 +852,89 @@ both of two tags, use `meta/serach/+$TAG1NAME +$TAG2NAME' with the space. It
 is not possible to exactly search for files having any of two tags (this is
 a MySQL fulltext search limitation), but this usually works, even for tags
 above the 50% threshold: `meta/serach/($TAG1NAME $TAG2NAME)'.
+
+Migration
+~~~~~~~~~
+Since movemetafs uses not only the file name, but also the device number
+(st_dev) and the inode number (st_ino) on the carrier filesystem to identify
+files, problems might arise when st_dev or st_ino change.
+
+st_dev changes
+
+-- when (part of) the filesystem is moved to another partition,
+-- or the data is copied (migrated) to another filesystem or another machine;
+-- or the device is connected under a different name (e.g. the hard
+   drive is recognized as /dev/sdb instead of /dev/sda);
+-- or the filesystem is rebuilt (e.g. the system is restored from a .tar.gz
+   backup).
+
+st_ino changes
+
+-- when the data is copied (migrated) to another filesystem or another
+   machine;
+-- or the filesystem is rebuilt (e.g. the system is restored from a .tar.gz
+   backup);
+-- or a file is moved in a `copy; delete' sequence.
+
+Extended attribute migration can be a solution in those cases.
+(It might succeed even if it is done late, after st_dev or st_ino has
+changed.) During extended attribute migration, st_dev and st_ino don't
+matter, because attribute dump and restore is based on file name (more
+precisely: principal name).
+
+The steps:
+
+1. Dump the attributes using `root/adm/dumpattr'.
+2. Copy everything recursively to the target filesystem, without copying
+   extended attributes.
+3. Copy the attribute dump to the target filesystem.
+4. Remove all movemetafs metadata on the target system.
+5. Restore the attribute dump on the target system.
+
+Example of migration with rsync(1) (simplified):
+
+  $ touch meta/root/user.mmfs.dump
+  $ mv meta/root/user.mmfs.dump meta/adm/dumpattr
+  $ rsync -aHvz meta/root/ targethost:carrier/
+  $ ssh target 'screen mmfs_fuse.pl --enable-purgeallmeta-p=1'
+  $ ssh targethost '
+      mkdir meta/adm/purgeallmeta
+      mv meta/root/user.mmfs.dump meta/adm/addtags
+      (cd meta/root && setfattr --restore=user.mmfs.dump)'
+
+Please note that the `-H' option of `rsync' is important -- otherwise hard
+links wouldn't have been preserved.
+
+Changing mount points and recovery from stale symlinks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+!! write this
+
+FAQ, troubleshooting
+~~~~~~~~~~~~~~~~~~~~
+Q1. `meta/search' doesn't find some of the files I've tagged.
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+Try to diagnose with `meta/tagged' first (see also question Q2). If it works
+in `meta/tagged', verify that your search query string is correct (read more
+in section ``Search query strings''). If your search query string is
+correct, try running `mkdir meta/adm/repair_taggings' and try the search
+again.
+
+Q2. `meta/tagged/$TAGNAME' doesn't contain a file I've tagged.
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+Look at the files `meta/tagged/$TAGNAME/:*:*:*'. Your file might be there.
+
+If you've tagged in GQview, are you sure that you saved the keywords before
+quitting?
+
+If `meta/tagged/$TAGNAME' contains a similarly named file with a stale
+symlink, you might have renamed the file outside movemetafs's control, or
+you might have changed mount points. Locating the file yourself and moving
+it to `meta/adm/fixprincipal' might help. If a lot of files are affcted,
+see section ``Changing mount points and recovery from stale symlinks''.
+
+Q3. `getfattr -d' reports an empty user.mmfs.description, but it shouldn't.
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+Try solutions for question Q2.
 
 Design decisions
 ~~~~~~~~~~~~~~~~
@@ -954,6 +1172,7 @@ Improvement possibilites
 !! SUXX: qiv, when moving to .qiv_trans, tries to remove principal name :-(
    unlink() fails, 2 links to file remain
 !! test with MySQL 4.1
+!! speed: why is `setfattr --restore' so slow?
 !! feature: fulltext search on descriptions
 !! feature: edit extended attributes in Midnight Commander
 !! test suite

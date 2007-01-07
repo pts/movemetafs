@@ -48,6 +48,8 @@ CREATE TABLE files (
   UNIQUE(ino,fs)
 ) ENGINE=InnoDB;
 
+-- Dat: tagtxt: `q' or something else is appended to words separated by space,
+--      see $mydb_concat_tags_sqlpart
 DROP TABLE IF EXISTS taggings;
 CREATE TABLE taggings (
   ino INTEGER UNSIGNED NOT NULL,

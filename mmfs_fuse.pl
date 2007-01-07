@@ -87,14 +87,20 @@ my %config_default=(
   'db.onconnect.8'=>undef,
   'db.onconnect.9'=>undef,
   'default.fs'=>'F',
-  'read.only.pp'=>0, # Imp: verify boolean
+  'read.only.p'=>0, # Imp: verify boolean
+  'enable.purgeallmeta.p'=>0, # Imp: verify boolean
   'verbose.level'=>1,
   #** Absolute dir. Starts with slash. Doesn't end with slash. Doesn't contain
   #** a double slash. Isn't "/".
   'mount.point'=>\1,
+  #** :String. Empty or ends with slash. May start with slash. Doesn't contain
+  #** a double slash. Empty string means current folder.
+  #** $root_prefix specifies the real filesystem path to be seen in
+  #** "$config{'mount.point'}/root"
   'root.prefix'=>'',
 );
 
+#** Processes a command-line option
 #** Dat: this is specific to movemetafs
 #** @return :Boolean processed?
 sub config_process_option($) {
@@ -103,7 +109,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.15 2007-01-07 17:00:02 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.16 2007-01-07 20:35:30 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -149,6 +155,18 @@ sub config_set($$;$) {
   $key
 }
 
+#** Dat: Good for config files ad `getfattr -d -e text' dumps.
+sub decode_cq($) {
+  my $S=$_[0];
+  $S=~s@\\([0-3]?[0-7]?[0-7])|\\(.)@
+    defined $1 ? chr(oct$1) :
+    $2 eq 'n' ? "\n" : $2 eq 't' ? "\t" : $2 eq 'f' ? "\f" :
+    $2 eq 'b' ? "\010" : $2 eq 'a' ? "\007" : $2 eq 'e' ? "\033" : # Dat: Perl
+    $2 eq 'v' ? "\013" : $2 eq 'r' ? "\r" : $2 # Dat: Perl doesn't have \v
+    @ges; # Imp: more, including \<newline>
+  $S
+}
+
 sub config_reread() {
   if (!@config_argv) {
     # Dat: see this above: $config_fn='movemetafs.conf';
@@ -167,15 +185,14 @@ sub config_reread() {
   while (defined($line=<$F>)) {
     next if $line!~/\S/ or $line=~/\A\s*\#/;
     my($key,$val);
-    die "missing key in config file: $config_fn, line $.\n" unless
+    die "syntax error in config file: $config_fn, line $.\n" unless
       $line=~s@\A\s*([^\s:=]+)\s*[:=]\s*@@;
     $key=$1;
-    if ($line=~m@\A"((?:[^\\"]+|\\.)*)"\s*\Z(?!\n)@s) {
-      $val=$1;
-      $val=~s@\\(.)@ $1 eq 'n' ? "\n" : $1 eq 't' ? "\t"
-        : $1 eq 'r' ? "\r" : $1 @ges; # Imp: more, including \<newline>
+    $line=~s@\s+\Z(?!\n)@@;
+    if ($line=~m@\A"((?:[^\\"]+|\\.)*)"(?!\n)@s) {
+      $val=decode_cq($1);
     } else {
-      $val=$line; $val=~s@\s+\Z(?!\n)@@;
+      $val=$line;
     }
     die "duplicate key $key in config file $config_fn, line $.\n" if
       $config_file_keys{$key};
@@ -309,7 +326,7 @@ sub db_transaction($;$) {
 # -- movemetafs-specific database routines (mydb_*())
 
 my $all_fs;
-my $all_dev; # st_dev of "$root_prefix/."
+my $all_dev; # st_dev of "$config{'root.prefix'}/."
 
 sub verify_tag($) {
   my($tag)=@_;
@@ -342,6 +359,10 @@ sub mydb_test($) {
   # vvv Dat: test write access
   db_do("UPDATE taggings SET ino=ino WHERE 1=2 LIMIT 1");
   db_do("DELETE FROM taggings WHERE 1=2 LIMIT 1");
+  db_transaction(sub {
+    db_do("INSERT INTO tags (ino,fs,tag) VALUES (1,2,3)");
+    $dbh->rollback();
+  });
   print STDERR "Tables OK.\n";
 }
 
@@ -472,12 +493,6 @@ sub mydb_gen_shorts($$$) {
   ($shortprincipal,$shortname)
 }
 
-#** :String. Empty or ends with slash. May start with slash. Doesn't contain
-#** a double slash. Empty string means current folder.
-#** $root_prefix specifies the real filesystem path to be seen in
-#** "$config{'mount.point'}/root"
-my $root_prefix='';
-
 #** Also verify_principal().
 sub verify_localname($) {
   my($localname)=@_;
@@ -492,7 +507,7 @@ sub verify_localname($) {
 sub file_localname_to_fs_ino($;$) {
   my($localname,$allow_nonfile_p)=@_;
   my @st;
-  die "localname not found\n" unless @st=lstat($root_prefix.$localname);
+  die "localname not found\n" unless @st=lstat($config{'root.prefix'}.$localname);
   die "localname not a file\n" if !$allow_nonfile_p and !-f _;
   die if !defined($all_fs) or 0==length($all_fs);
   die if !defined($all_dev);
@@ -557,7 +572,9 @@ sub mydb_delete_from_files_if_no_info_and_tags($$) {
   }
 }
 
-#** Changes files.principal.
+#** Dat: also changes files.principal.
+#** Dat: if $oldfn eq $fn, this is equivalent to moving the file to
+#**      `meta/adm/fixprincipal'.
 sub mydb_rename_fn($$) {
   my($oldfn,$fn)=@_;
   print STDERR "DB_RENAME_FN oldfn=($fn) fn=($fn)\n" if $config{'verbose.level'};
@@ -733,7 +750,7 @@ sub mydb_repair_taggings() {
   print STDERR "DB_REPAIR_TAGGINGS\n" if $config{'verbose.level'};
   db_transaction(sub {
     db_do("DELETE FROM taggings WHERE NOT EXISTS (SELECT * FROM tags WHERE ino=taggings.ino AND fs=taggings.fs)");
-    #db_do("SET SESSION group_concat_max_len = $db_big_31bit"); # !!
+    db_do("SET SESSION group_concat_max_len = $db_big_31bit");
     # vvv Dat: this is quite fast on 10000 rows
     # vvv Dat: good, doesn't insert empty `tags'
     # !! this makes mysqld crash because of huge group_concat_max_len
@@ -945,6 +962,110 @@ sub mydb_unlink_last($$$) {
   }
 }
 
+#** Converts empty string to empty string, newline to ="\012" etc,
+#** similar to `getfattr -e text'.
+sub getfattr_eqvalq($) {
+  return '' if 0==length($_[0]);
+  my($S)=@_;
+  # vvv Dat: wastes: converts a 2-byte UTF-8 character to 8 bytes...
+  $S=~s@([^ -~])@ sprintf"\\%03o", ord$1 @ge;
+  qq(="$S")
+}
+
+#** Produces a dump similar to `getfattr -R -d -e text'
+#** Dat: doesn't touch the filesystem, gets everything from the database.
+#** @param $prefix '' or "$principalprefix/"
+#** @param $F IO-handle to write (but don't close)
+sub mydb_attr_dump($$) {
+  my($prefix,$F)=@_;
+  $prefix=~s@/+\Z(?!\n)@@;
+  $prefix=~s@//+@/@g;
+  $prefix=~s@\A/+@@;
+  print STDERR "DB_ATTR_DUMP prefix=($prefix)\n" if $config{'verbose.level'};
+  #print $F "hello, world\n";
+  db_do("SET SESSION group_concat_max_len = $db_big_31bit");
+  my $prefixq=$prefix;
+  $prefixq=~s@([%_\\])@\\$1@g; # Dat: MySQL-specific quoting for LIKE # Imp: more metachars?
+  my $sth=db_query("SELECT principal, descr,
+    GROUP_CONCAT(tag ORDER BY tag SEPARATOR ' ')
+    FROM files LEFT OUTER JOIN tags ON
+         files.ino=tags.ino AND files.fs=tags.fs
+    WHERE principal LIKE ?
+    GROUP BY files.ino, files.fs", $prefixq.'%');
+  # ^^^ Dat: MySQL is smart enough to optimize away `x LIKE '%''
+  my($principal,$descr,$tags);
+  my $C=0; my $nbytes=0;
+  while (($principal,$descr,$tags)=$sth->fetchrow_array()) {
+    $tags="" if !defined $tags; # Dat: no tags
+    print STDERR "warning: removed newline from file name\n" if
+      $principal=~s@\n+@@g;
+    my $E="# file: $principal\nuser.mmfs.description".
+      getfattr_eqvalq($descr)."\nuser.mmfs.tags".getfattr_eqvalq($tags)."\n\n";
+    if (!print($F $E)) {
+      print STDERR "warning: write error: $!\n";
+      last
+    }
+    $C++; $nbytes+=length($E);
+  }
+  $sth->finish();
+  print STDERR "DB_ATTR_DUMP prefix=($prefix) nfiles=$C nbytes=$nbytes\n" if $config{'verbose.level'};
+}
+
+#** @param $F IO-handle to be read
+sub mydb_add_tags_from_io($$) {
+  my($real,$F)=@_;
+  print STDERR "DB_ADD_TAGS_FROM_IO\n" if $config{'verbose.level'};
+  my $line;
+  my $ntags=0;
+  my %added_tags; # Imp: empty it when reaches 10000 etc. (ruins $ntags)
+  db_transaction(sub {
+    while (defined($line=<$F>)) {
+      next if $line!~m@\S@ or $line=~m@\A\s*#@;
+      my @newtags;
+      if ($line=~s@\A\Quser.mmfs.tags="@@) {
+        chomp($line); pos($line)=0;
+        while ($line=~m@\\.|(")@sg) {
+          if (defined $1) { substr($line,pos($line)-length($1))=""; last }
+        }
+        # ^^^ Imp: syntax error when no trailing quote
+        $line=decode_cq($line);
+      } elsif ($line=~m@\A[^="]+="@ or $line=~m@\A\Quser.@) {
+        next
+      }
+      for my $tag (split' ',$line) {
+        verify_tag($tag);
+        if ($@) {
+          print STDERR "warning: syntax error in tags file $real, line $.; line ignored\n";
+          @newtags=(); last
+        }
+        push @newtags, $tag;
+      }
+      for my $tag (@newtags) { next if exists $added_tags{$tag};
+        # vvv Dat: similar to mydb_insert_tag()
+        # vvv Imp: is `INSERT IGNORE' much faster?
+        my $rv=db_do("INSERT INTO tags (tag,ino,fs) VALUES (?,0,'') ON DUPLICATE KEY UPDATE tag=VALUES(tag)", $tag);
+        print STDERR "DB_ADD_TAGS_FROM_IO new tag=($tag) rv=$rv\n" if $config{'verbose.level'};
+        $ntags++; $added_tags{$tag}=1;
+      }
+    }
+  });
+  print STDERR "DB_ADD_TAGS_FROM_IO ntags=($ntags)\n" if $config{'verbose.level'};
+}
+
+#** Dat: this is dangerous
+sub mydb_purgeallmeta() {
+  # !! test with long and lot of tags
+  # vvv Dat: no serious need of transaction on `taggings')
+  print STDERR "DB_PURGEALLMETA\n" if $config{'verbose.level'};
+  db_transaction(sub {
+    # vvv Imp: transactions
+    db_do("TRUNCATE TABLE taggings");
+    db_do("TRUNCATE TABLE files");
+    db_do("TRUNCATE TABLE tags");
+  });
+  print STDERR "DB_PURGEALLMETA finished.\n" if $config{'verbose.level'};
+}
+
 #die $dbh->{AutoCommit};
 #db_connect()->begin_work();
 ##die $dbh->{AutoCommit} ? 1 : 0;
@@ -981,7 +1102,7 @@ sub diemsg_to_nerrno() {
 }
 
 
-# ---
+# --- FUSE-relanted functions, starting with my_*()
 
 # vvv Dat: SUXX: cannot kill processes using the mount point
 #     Dat: cannot reconnect
@@ -1013,14 +1134,14 @@ END { cleanup_umount(); }
 #$SIG{QUIT}=\&exit_signal;
 # Dat: don't hook QUIT
 
-#** Removes /root/, prepends $root_prefix.
+#** Removes /root/, prepends $config{'root.prefix'}.
 #** @return undef if not starting with root (or if result would start with
 #**   $config{'mount.point'}); filename otherwise
 sub sub_to_real($) {
   my $fn=$_[0];
   return undef if $fn!~s@\A/root(?=/|\Z(?!\n))@@;
   ## Dat: now substr($fn,0,1) eq '/', so an empty root_prefix would yield /
-  substr($fn,0,0)=(0==length($root_prefix)) ? '.' : $root_prefix;
+  substr($fn,0,0)=(0==length($config{'root.prefix'})) ? '.' : $config{'root.prefix'};
   $fn="/" if 0==length($fn);
   #print STDERR "SUB_TO_REAL() real=$fn\n";
   my $mpoint=$config{'mount.point'};
@@ -1084,8 +1205,10 @@ sub my_getattr($) {
   my $blocks=0;
   if ($fn eq '/') {
   # vvv Dat: top level dirs have high priority, because getattr(2) is called for them
-  } elsif ($fn eq '/tag' or $fn eq '/untag' or $fn eq '/tagged',
-    or $fn eq '/search' or $fn eq '/adm') {
+  } elsif ($fn eq '/tag' or $fn eq '/untag' or $fn eq '/tagged' or
+    $fn eq '/search' or $fn eq '/adm' or $fn eq '/adm/fixprincipal'
+    #or $fn eq '/adm/dumpattr'
+    ) {
   } elsif ($fn eq '/root') {
   } elsif (defined($real=sub_to_real($fn))) {
     # Dat: rofs also uses lstat() instead of stat()
@@ -1151,10 +1274,10 @@ sub my_getdir($) {
     my @L=eval { mydb_find_tagged_shortnames($1) };
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
-  } elsif ($dir eq '/search' or $dir eq '/untag/:all' or $dir eq '/adm') {
+  } elsif ($dir eq '/search' or $dir eq '/untag/:all') {
     return ('.','..',0);
   } elsif ($dir eq '/adm') {
-  
+    return ('.','..','fixprincipal',0);
   } elsif (!defined($real=sub_to_real($dir))) {
     # Dat: getdents64() returns ENOENT, but open(...O_DIRECTORY) succeeds
     return -1*Errno::ENOENT; # Imp: probably ENOTDIR
@@ -1328,6 +1451,12 @@ sub my_mkdir($$) {
       return diemsg_to_nerrno();
       # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
       #          and return Errno::ENOENT to the application.
+    } elsif ($fn eq '/adm/purgeallmeta') {
+      return -1*Errno::EOPNOTSUPP if !$config{'enable.purgeallmeta.p'};
+      eval { mydb_purgeallmeta(); };
+      return diemsg_to_nerrno();
+      # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
+      #          and return Errno::ENOENT to the application.
     }
     return -1*Errno::EPERM
   } elsif (!mkdir($real,$mode)) {
@@ -1404,6 +1533,7 @@ sub my_link($$) {
   }
 }
 
+#** Dat: FUSE doesn't call us when $oldfn eq $fn.
 sub my_rename($$) {
   my($oldfn,$fn)=@_;
   my($oldreal,$real);
@@ -1416,6 +1546,27 @@ sub my_rename($$) {
       return -1*Errno::EPERM if $tag eq ':all' and $op ne 'untag';
       eval { $op eq 'tag' ? mydb_op_tag($oldfn,$tag) : mydb_op_untag($oldfn,$tag) };
       return diemsg_to_nerrno()
+    } elsif ($fn=~m@/adm/fixprincipal/[^/]+\Z(?!\n)@ &&
+             defined($oldreal=sub_to_real($oldfn))) {
+      # Dat: we ignore the target name inside /adm/fixprincipal
+      eval { mydb_rename_fn($oldfn,$oldfn) };
+      return diemsg_to_nerrno()
+    } elsif ($fn eq '/adm/dumpattr' and
+             defined($oldreal=sub_to_real($oldfn))) {
+      my($F);
+      return -1*$! if !open($F, '>', $oldreal);
+      # vvv imp: dump only parts...
+      eval { mydb_attr_dump('', $F) };
+      return -1*$! if !close($F);
+      return diemsg_to_nerrno()
+    } elsif ($fn eq '/adm/addtags' and
+             defined($oldreal=sub_to_real($oldfn))) {
+      my($F);
+      return -1*$! if !open($F, '<', $oldreal);
+      # vvv imp: dump only parts...
+      eval { mydb_add_tags_from_io($oldreal,$F) };
+      return -1*$! if !close($F);
+      return diemsg_to_nerrno()
     } elsif ($fn=~m@/(tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
       my $op=$1; my $tag=$2;
       if ($oldfn=~m@/(tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
@@ -1424,15 +1575,17 @@ sub my_rename($$) {
         return diemsg_to_nerrno()
       }
     }
-    return -1*Errno::EPERM
   } elsif (!defined($oldreal=sub_to_real($oldfn))) {
-    return -1*Errno::EXDEV
+    # Dat: although mv(1) can get EXDEV here, we don't want it to, because
+    #      then it tries to copy recursively. So we return EPERM.
+    #return -1*Errno::EPERM
   } elsif (!rename($oldreal,$real)) {
     return -1*$!
   } else {
     eval { mydb_rename_fn($oldfn,$fn) };
     return diemsg_to_nerrno()
   }
+  return -1*Errno::EPERM
 }
 
 sub my_readlink($) {
@@ -1609,12 +1762,12 @@ if ((@L or $! !=Errno::ENOTCONN) and !(-d _)) {
   die "$0: cannot create mount.point $config{'mount.point'}: $!\n" if !mkdir($config{'mount.point'});
 }
 
-$root_prefix=~s@//+@/@g;
-$root_prefix=~s@/*\Z(?!\n)@/@;
-$root_prefix=~s@\A/+@/@;
+$config{'root.prefix'}=~s@//+@/@g;
+$config{'root.prefix'}=~s@/*\Z(?!\n)@/@;
+$config{'root.prefix'}=~s@\A/+@/@;
 $all_fs=config_get('default.fs','F'); # !!
-{ my @st=lstat("$root_prefix/.");
-  die "$0: cannot stat --root-prefix=: $root_prefix\n" if !@st;
+{ my @st=lstat("$config{'root.prefix'}/.");
+  die "$0: cannot stat --root-prefix=: $config{'root.prefix'}\n" if !@st;
   $all_dev=$st[0];
   #die "all_dev=$all_dev\n";
 }
