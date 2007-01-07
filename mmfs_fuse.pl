@@ -1390,15 +1390,15 @@ sub my_listxattr($) {
   my $real;
   my @attrs;
   print STDERR "LISTXATTR($fn)\n" if $DEBUG;
-  # Dat: getfattr(1) `getfattr -d' needs the "mmfs." prefix
+  # Dat: getfattr(1) `getfattr -d' needs the "user.mmfs." prefix
   if ($fn eq '/root' or !defined($real=sub_to_real($fn))) {
     # Dat: `meta/root' is also a fakenode, since it doesn't have a valid
     #      $localname
-    push @attrs, 'mmfs.fakenode';
+    push @attrs, 'user.mmfs.fakenode';
   } else {
-    push @attrs, 'mmfs.realnode';
-    push @attrs, 'mmfs.tags'; # Dat: lazy here, even for files with no tags
-    push @attrs, 'mmfs.description'; # Dat: lazy here, even for files with an empty description
+    push @attrs, 'user.mmfs.realnode';
+    push @attrs, 'user.mmfs.tags'; # Dat: lazy here, even for files with no tags
+    push @attrs, 'user.mmfs.description'; # Dat: lazy here, even for files with an empty description
   }
   push @attrs, 0; # $errno indicator
   #print STDERR "ATTRS=@attrs\n";
@@ -1413,17 +1413,17 @@ sub my_getxattr_low($$) {
   my($fn,$attrname)=@_;
   my $real=sub_to_real($fn);
   # Imp: maybe return non-zero errno
-  if ($attrname eq 'mmfs.fakenode') {
+  if ($attrname eq 'user.mmfs.fakenode') {
     return defined($real) ? 0 : "1"
-  } elsif ($attrname eq 'mmfs.realnode') {
+  } elsif ($attrname eq 'user.mmfs.realnode') {
     return defined($real) ? "1" : 0
-  } elsif ($attrname eq 'mmfs.tags') {
+  } elsif ($attrname eq 'user.mmfs.tags') {
     return 0 if !defined $real;
     my @tags=eval { mydb_file_get_tags($fn) };
     return '' if $@ eq "localname not a file\n"; # Imp: test after preprocessing
     return diemsg_to_nerrno() if $@;
     join(' ',@tags)
-  } elsif ($attrname eq 'mmfs.description') {
+  } elsif ($attrname eq 'user.mmfs.description') {
     return 0 if !defined $real;
     my $descr=eval { mydb_file_get_descr($fn) };
     return '' if $@ eq "localname not a file\n"; # Imp: test after preprocessing
@@ -1447,15 +1447,15 @@ sub my_setxattr_low($$$$) {
   my $real=sub_to_real($fn);
   return -1*Errno::EPERM if !defined($real);
   # Imp: maybe return non-zero errno
-  if ($attrname eq 'mmfs.tags') {
+  if ($attrname eq 'user.mmfs.tags') {
     eval { mydb_file_set_tagtxt($fn,$attrval) };
     return diemsg_to_nerrno();
-  } elsif ($attrname eq 'mmfs.description') {
+  } elsif ($attrname eq 'user.mmfs.description') {
     eval { mydb_file_set_descr($fn,$attrval) };
     return diemsg_to_nerrno();
   } elsif (my_getxattr_low($fn,$attrname) eq $attrval) {
     # ^^^ Imp: `eq' on error messages
-    # Dat: this is so `setxattr --restore' runs cleanly on `mmfs.realnode'
+    # Dat: this is so `setxattr --restore' runs cleanly on `user.mmfs.realnode'
     return 0
   }
   return -1*Errno::EPERM
@@ -1494,7 +1494,7 @@ sub my_removexattr($$) {
     elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
     elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
     elsif ($ARGV[$I] eq '--version') {
-      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.13 2007-01-07 15:18:47 pts Exp $'."\n";
+      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.14 2007-01-07 15:25:17 pts Exp $'."\n";
       print STDERR "by Pe'ter Szabo' since early January 2007\n";
       print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
       exit 0

@@ -678,6 +678,10 @@ Since searching should be faster than tagging, the calculation of
 short names is done when a file is tagged, untagged (or its description
 is changed etc.).
 
+The reason why the `user.mmfs.' prefix was chosen for the POSIX extended
+attributes was that FUSE works with `user.' only (other attributes are not
+returned to the process), but `user.' is too broad and generic.
+
 Why did we choose Linux?
 
 -- We like all Unix systems in general, however FUSE doesn't run on many
