@@ -111,7 +111,7 @@ Current limitations:
 -- no `$TAGNAME1 OR $TAGNAME2' searches
 -- file descriptions are not searchable
 
-Requirements (install them in this order):
+Dependencies (install them in this order):
 
 -- operating system capable of running FUSE (currently Linux and FreeBSD,
    movemetafs is tested only on Linux >=2.6.18)
@@ -125,7 +125,10 @@ Requirements (install them in this order):
 -- Perl >=5.8
 -- the Fuse Perl module (install with `cpan Fuse' as root)
 -- MySQL server >=4.1 (you don't have to change your existing MySQL server
-   configuration if you use pts-mysql-local)
+   configuration if you use pts-mysql-local). movemetafs is being tested
+   with MySQL server 5.1. Please let me know if it
+   doesn't work with 5.0 or 4.1. Earlier versions of MySQL are not supported
+   by movemetafs.
 -- a recent MySQL client library (such as /usr/lib/libmysqlclient.so.*) and
    headers (such as /usr/include/mysql/mysql.h) (e.g.
    `apt-get install libmysqlclient15-dev' on Debian Sarge)
@@ -157,26 +160,57 @@ description) in a *.meta file (near the image file or in
 make GQview store metadata in the movemetafs metadata store for images
 inside `meta/root'.  This makes GQview a very nice and powerful user
 interface for movemetafs when managing images.
-!! more about this patch
-!! emulate read and write of *.meta files (not enough detail in error
-   messages)
 
-Installation quickstart
-~~~~~~~~~~~~~~~~~~~~~~~
-!! this section isn't written properly
+How to install
+~~~~~~~~~~~~~~
+All steps (except where indicated) should be done your regular, normal user,
+not as root.
 
 1. Download movemetafs from http://www.inf.bme.hu/~pts/ or
    http://freshmeat.net/projects/movemetafs/
-2. Install the requirements (see above).
-3. Mount your carrier filesystem on which you want to have metadata on.
-4. (Copy the mmfs_fuse.pl executable to your $PATH.)
-5. Modify your database password in both movemetafs.conf and recreate.sql.
-6. Modify the MySQL database connect string (db.dsn) for your mySQL setup
-   in movemetafs.conf.
-7. Create the MySQL database (with `mysql <recreate.sql').
-8. Start mmfs_fuse.pl with the appropriate arguments, which will mount your
-   filesystem with a new mount point. The config file (movemetafs.conf) is
-   looked for in the current directory.
+2. Install the dependencies (see above).
+3. Load the `fuse' kernel module. If not found, compile or install it, and
+   reboot if necessary. Test with `grep "^fuse " /proc/modules'.
+4. Extract the distribution tarball and chdir() to the folder just extracted.
+   You will be running `mmfs_fuse.pl' from here.
+5. Copy the file `movemetafs.conf.ex' to `movemetafs.conf'.
+6. Start the MySQL database server.
+7. Connect to your MySQL server with the mysql(1) client utility. Connect
+   with a user having the privileges of creating databases, creating users
+   and granting rights. Usually `mysql --user=root --password' should do the
+   trick. On success, exit from `mysql'.
+8. Change the string `put_password_here' in both `movemetafs.sql' and
+   `recreate.sql' to a more secret password, which will be used by
+   `mmfs_fuser.pl' for connecting to the MySQL server.
+9. Initialize the MySQL database using `recreate.sql'. Use the mysql(1)
+   command that worked in step 6, like this:
+
+     $ mysql --user=root --password <recreate.sql
+
+   You shouldn't get any errors.
+   
+   This creates the database `momvemetafs', the tables and other schema
+   elements, the MySQL user `movemetafs_rw', and the appropriate rights for
+   the user to access the database.
+
+   This has to be done only once on the same machine, because it destroys
+   all metadata known to movemetafs.
+10. Edit `movemetafs.conf'. The defaults are almost always correct, except
+    for the key `db.dsn', which should point to the MySQL server. Examples:
+
+      db.dsn: dbi:mysql:database=movemetafs:mysql_socket=/var/run/mysql.sock
+      db.dsn: dbi:mysql:database=movemetafs:host=localhost;port=3306
+
+    You have already changed the password in `db.auth' above:
+
+      db.auth: some_hard_to_guess_password
+
+    Read more about the available options in section ``Statup
+    configuration''.
+11. Run `mmfs_fuse.pl --test-db'. It shouldn't print any errors, but
+    `Database connect OK.' and `Tables OK.'.
+12. If you want to try movemetafs right now, continue in section
+    ``How to use''.
 
 Basic concepts: carrier and meta filesystems etc.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -306,14 +340,21 @@ You can verify that all 3 bytes are present:
   # file: meta/root/dir/file
   mmfs.description="a\000b"
 
-How to use
-~~~~~~~~~~
+Startup configuration
+~~~~~~~~~~~~~~~~~~~~~
+`mmfs_fuse.pl' is the user-level process that provides the meta filesystem.
+All !!
+
 After installation, mount the meta filesystem by running mmfs_fuse.pl
 with the appropriate command-line arguments. Usually it is enough to
 specify --root-prefix= and --mount-point=. If necessary, specify --quiet.
 
 The most important options for mmfs_fuse.pl:
 
+-- --config-file=<file>
+-- --version
+-- --help
+-- --test-db
 -- --root-prefix=<dir>: the carrier filesystem folder, this will be
    visible as `meta/root'. This option is recommended (default: current
    directory of the ./mmfs_fuse.pl program invocation). You may
@@ -328,7 +369,21 @@ Please remember the command-line options (especially --root-prefix=),
 because finding tagged files might not work if some crucial options are
 different when remounting it later.
 
-The mmfs_fuse.pl script should remain running while you want to access the
+How to use
+~~~~~~~~~~
+Startup steps:
+
+1. Install movemetafs if you haven't done so (read details in section
+   ``How to install''.
+2. Mount the carrier filesystem(s) (on which the files you want to tag
+   reside).
+3. Start the MySQL database server.
+4. Ensure that the `fuse' kernel module is loaded. This has to be done as
+   root.
+5. Start `mmfs_fuse.pl' with the appropriate configuration, as documented in
+   the section ``Startup configuration''. This mounts the meta filesystem.
+
+The `mmfs_fuse.pl' script should remain running while you want to access the
 filesystem, so it is recommended to start the script inside screen(1). If
 mmfs_fuse.pl dies, you have to unmount the meta filesystem with `fusermount
 -u /path/to/meta' before mounting it again. All these operations can be done
@@ -552,8 +607,11 @@ Special folders are:
    -- `meta/search/$QUERYSTRING' uses the MySQL table `taggings', while
       `meta/tag/$TAGNAME' uses the table `tags'. Should any mismatch arise,
       `mkdir meta/repair_taggings' regenerates `taggings' from `tags'.
--- meta
-   -- If the folder `meta/repair_taggings' is attempted to be created,
+-- meta/adm
+   -- The folder `meta/adm' appears to be empty.
+   -- `meta/adm' can be used to issue administrative and recovery commands
+      to movemetafs.
+   -- If the folder `meta/adm/repair_taggings' is attempted to be created,
       movemetafs regenerates the `taggings' table from the `tags' table, and
       the operation returns `No such file or directory' on success. This
       regeneration can be quite slow, since the time needed is proprtional
@@ -769,6 +827,14 @@ possible, and send your report in e-mail to Péter Szabó <pts@fazekas.hu>.
 
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
+!! doc: more about the GQview patch
+!! doc: how to tag images, videos etc.
+!! feature: emulate read and write of *.meta files (not enough detail in error
+   messages)
+!! feature: add tags and description to a tag (not too hard, use special
+   `fs', and map `ino' using extra table)
+!! feature: read(2) based meta/adm interface -- readlink(2) is not good to
+   execute a command, because mc(1) would read the links when `cd meta/adm'
 !! feature: add values to tags, e.g. `user.foo="bar"' for tag `foo'.
 !! rethink: prepending :%x:%s: to short names ruins their sort order
 !! feature: multiple filesystem support based on UUID (this would survive
@@ -797,10 +863,9 @@ Improvement possibilites
    I personally find it very counterintuitive to sometimes take short words
    into consideration for phrase searches, but only if there is at least one
    properly long word in the search phrase.
-!! Dat: <50% threshold even without `IN NATURAL LANGUAGE MODE'
+!! Dat: MySQL fulltext <50% threshold even without `IN NATURAL LANGUAGE MODE'
 !! try: search without a stat (chdir(), stat(), ls(1))
 !! try: chdir(), readdir()
-!! verify: `_' in fulltext search separator
 !! think: fulltext index needs MyISAM tables. Do they survive a system
    crash? No, because MyISAM is not journaling. So we should have a copy of
    the words in a regular InnoDB table, too.
@@ -882,13 +947,13 @@ Improvement possibilites
 !! mv(1) first unlinks target before
    `mv /tmp/mp/tag/bar/\:5d53a\:F\:one /tmp/mp/tag/űrkikötő/',
    but what if we then get an `Operation not permitted'.
-!! easy: --config-file=
 !! fix: avoid target file already exists when moving to `meta/tag/$TAGNAME'
    in Midnight Commander; What if symlink by that name already exists?
 	   Better to keep `meta/tag' empty.
 !! doc: file manager with POSIX extended attributes (not Midnight Commander)
 !! SUXX: qiv, when moving to .qiv_trans, tries to remove principal name :-(
    unlink() fails, 2 links to file remain
+!! test with MySQL 4.1
 !! feature: fulltext search on descriptions
 !! feature: edit extended attributes in Midnight Commander
 !! test suite

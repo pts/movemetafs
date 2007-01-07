@@ -25,7 +25,7 @@ GRANT Select,Insert,Update,Delete ON movemetafs.* TO 'movemetafs_rw'@'localhost'
 -- GRANT ALL ON movemetafs.* TO 'movemetafs_full'@'localhost';
 
 DROP TABLE IF EXISTS files;
--- Imp: BIGINT instead of INT for ino
+-- Imp: what if sizeof(st_ino)>sizeof(INTEGER)?
 -- Imp: later add sum_sha1 BINARY(40),
 -- Dat: principal doesn't start with slash, and it is not empty
 -- Dat: descr is a free text description of the file (UTF-8)
@@ -66,4 +66,26 @@ CREATE TABLE tags (
   tag VARCHAR(255),
   UNIQUE(tag,ino,fs),
   UNIQUE(ino,fs,tag)
+) ENGINE=InnoDB;
+
+-- Imp: what if sizeof(st_ino)>sizeof(INTEGER)?
+-- Dat: mpoint starts by `/', doesn't contain `//', and it doesn't end with
+   `//' except for `/'
+-- Dat: mpoint is usually a valid mount point in /proc/mounts, except for
+   `/'
+-- Dat: stat(mpoint) yields (dev,root_ino)
+-- Dat: stat(mpoint+"../../...") yields (dev,top_ino)
+-- Dat: root_ino=mpoint_ino  except if mpoint='/'
+-- Dat: fs is not empty
+-- Dat: mpoint is UNIQUE (but keysize is too large for InnoDB)
+DROP TABLE IF EXISTS fss;
+CREATE TABLE fss (
+  fs VARBINARY(127) NOT NULL UNIQUE,
+  mpoint VARBINARY(32000) NOT NULL,
+  dev INTEGER UNSIGNED NOT NULL UNIQUE,
+  root_ino INTEGER UNSIGNED NOT NULL,
+  top_ino INTEGER UNSIGNED NOT NULL,
+  CHECK(fs<>''),
+  CHECK(mpoint<>''),
+  INDEX(mpoint)
 ) ENGINE=InnoDB;

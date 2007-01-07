@@ -38,9 +38,9 @@
 # Dat: if the fuse server process aborts instead of replying, the client gets:
 #      Software caused connection abort
 # Dat: FUSE removes trailing slash from e.g. $fn of my_getattr. Good.
-# Dat: FUSE is smart enough so GETDIR gets / instead of $mount_point, so we
-#      can avoid the deadlock. But we nevertheless hide $mount_point inside
-#      $mount_point.
+# Dat: FUSE is smart enough so GETDIR gets / instead of $config{'mount.point'}, so we
+#      can avoid the deadlock. But we nevertheless hide $config{'mount.point'} inside
+#      $config{'mount.point'}.
 # Dat: FUSE always calls GETATTR first, so open() usually doesn't report
 #      Errno::ENOENT, because GETATTR has already done it.
 # Dat: we use UTF-8 Perl strings, not Unicode ones (the utf8 flag is off)
@@ -59,11 +59,143 @@ use DBI;
 #use DBD::mysql; # Dat: automatic for DBI->connect
 
 use vars qw($VERSION); # Dat: see also CVS ID 
-BEGIN { $VERSION='0.04' }
+BEGIN { $VERSION='0.05' }
 
-use vars qw($DEBUG);
-$DEBUG=1;
+# --- Configuration functions
 
+my @config_argv;
+my %config;
+$config{'verbose.level'}=1;
+my $config_fn='movemetafs.conf'; # !! change in the command line
+
+#** Only keys listed in %config_default are allowed in the config file, other
+#** keys are ignored (warning if read from the config file, error if specified
+#** in the command line).
+#**   If the default value is a scalar ref (e.g. \1), the key is mandatory.
+#** Dat: no `-' or `_' here, only `.'
+my %config_default=(
+  'db.dsn'=>\1,
+  'db.username'=>'root',
+  'db.auth'=>'',
+  'db.onconnect.1'=>undef,
+  'db.onconnect.2'=>undef,
+  'db.onconnect.3'=>undef,
+  'db.onconnect.4'=>undef,
+  'db.onconnect.5'=>undef,
+  'db.onconnect.6'=>undef,
+  'db.onconnect.7'=>undef,
+  'db.onconnect.8'=>undef,
+  'db.onconnect.9'=>undef,
+  'default.fs'=>'F',
+  'read.only.pp'=>0, # Imp: verify boolean
+  'verbose.level'=>1,
+  #** Absolute dir. Starts with slash. Doesn't end with slash. Doesn't contain
+  #** a double slash. Isn't "/".
+  'mount.point'=>\1,
+  'root.prefix'=>'',
+);
+
+#** Dat: this is specific to movemetafs
+#** @return :Boolean processed?
+sub config_process_option($) {
+  my($opt)=@_;
+  if (0) {}
+  elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
+  elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
+  elsif ($opt eq '--version') {
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.15 2007-01-07 17:00:02 pts Exp $'."\n";
+    print STDERR "by Pe'ter Szabo' since early January 2007\n";
+    print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
+    exit 0
+  }
+  elsif ($opt eq '--help') { die "$0: no --help, see README.txt\n" }
+  elsif ($opt eq '--test-db') { mydb_test(); exit }
+  elsif ($opt=~/--config-file=(.*)/s) { } # Dat: too late to set $config_fn=$1
+  else { return 0 }
+  1
+}
+
+sub config_process_argv() {
+  my $I;
+  if (!@config_argv) {
+    for ($I=0;$I<@ARGV;$I++) {
+      if ($ARGV[$I] eq'-' or substr($ARGV[$I],0,1)ne'-') { last }
+      elsif ($ARGV[$I] eq '--') { $I++; last }
+      push @config_argv, $ARGV[$I];
+    }
+    splice @ARGV, 0, $I, '--';
+    push @config_argv, '--'; # Dat: to make config_process_argv() idempotent
+  }
+  for my $arg (@config_argv) {
+    if ($arg eq '--') { last }
+    elsif (config_process_option($arg)) {}
+    elsif ($arg=~/-+([^=]+)=(.*)/s) { config_set($1,$2) }
+    else { die "$0: unknown option: $arg\n" }
+  }
+  undef
+}
+
+#** @return processed key
+sub config_set($$;$) {
+  my($key,$val,$warn_p)=@_;
+  $key=~y@-_@..@;
+  #print STDERR "\$config{'$key'}='$val';\n";
+  if (exists $config_default{$key}) {
+    $config{$key}=$val;
+  } elsif ($warn_p) {
+    print STDERR "$0: warning: unknown key $key in config file $config_fn\n";
+    $key='';
+  } else { die "$0: unknown config key: $key\n" }
+  $key
+}
+
+sub config_reread() {
+  if (!@config_argv) {
+    # Dat: see this above: $config_fn='movemetafs.conf';
+    # Imp: find config file near $0
+    for (my $I=0;$I<@ARGV;$I++) {
+      if ($ARGV[$I] eq'-' or substr($ARGV[$I],0,1)ne'-') { last }
+      elsif ($ARGV[$I] eq '--') { $I++; last }
+      elsif ($ARGV[$I]=~/--config-file=(.*)/s) { $config_fn=$1 }
+    }
+  }
+  %config=map { 'SCALAR' eq ref $config_default{$_} ? () :
+    ($_ => $config_default{$_}) } keys %config_default;
+  my %config_file_keys;
+  my $line;
+  die "$0: cannot open config file $config_fn: $!\n" unless open my($F), '<', $config_fn;
+  while (defined($line=<$F>)) {
+    next if $line!~/\S/ or $line=~/\A\s*\#/;
+    my($key,$val);
+    die "missing key in config file: $config_fn, line $.\n" unless
+      $line=~s@\A\s*([^\s:=]+)\s*[:=]\s*@@;
+    $key=$1;
+    if ($line=~m@\A"((?:[^\\"]+|\\.)*)"\s*\Z(?!\n)@s) {
+      $val=$1;
+      $val=~s@\\(.)@ $1 eq 'n' ? "\n" : $1 eq 't' ? "\t"
+        : $1 eq 'r' ? "\r" : $1 @ges; # Imp: more, including \<newline>
+    } else {
+      $val=$line; $val=~s@\s+\Z(?!\n)@@;
+    }
+    die "duplicate key $key in config file $config_fn, line $.\n" if
+      $config_file_keys{$key};
+    my $keypp=config_set($key, $val, 1);
+    $config_file_keys{$keypp}=1 if defined $keypp;
+  }
+  die if !close($F);
+  config_process_argv();
+  for my $key (sort keys %config_default) {
+    die "$0: missing mandatory config key $key, see README.txt\n" if
+      !defined $config{$key} and 'SCALAR' eq ref $config_default{$key};
+  }
+  undef
+}
+
+sub config_get($;$) {
+  my($key,$default)=@_;
+  config_reread() if !%config;
+  defined $config{$key} ? $config{$key} : $default
+}
 
 # --- Generic functions
 
@@ -87,41 +219,6 @@ sub verify_utf8($) {
   my($S)=@_;
   die "bad UTF-8 string\n" if $S!~/\A(?:[\000-\177]+|[\xC0-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF7][\x80-\xBF]{3})*\Z(?!\n)/;
   undef
-}
-
-# --- Configuration functions
-
-my %config;
-my $config_fn='movemetafs.conf'; # !! change in the command line
-
-sub config_reread() {
-  die unless open my($F), '<', $config_fn;
-  %config=();
-  my $line;
-  while (defined($line=<$F>)) {
-    next if $line!~/\S/ or $line=~/\A\s*\#/;
-    my($key,$val);
-    die "missing key in config file: $config_fn, line $.\n" unless
-      $line=~s@\A\s*([^\s:=]+)\s*[:=]\s*@@;
-    $key=$1;
-    if ($line=~m@\A"((?:[^\\"]+|\\.)*)"\s*\Z(?!\n)@s) {
-      $val=$1;
-      $val=~s@\\(.)@ $1 eq 'n' ? "\n" : $1 eq 't' ? "\t"
-        : $1 eq 'r' ? "\r" : $1 @ges; # Imp: more, including \<newline>
-    } else {
-      $val=$line; $val=~s@\s+\Z(?!\n)@@;
-    }
-    die "duplicate key in config file: $config_fn, line $.\n" if
-      exists $config{$key};
-    $config{$key}=$val
-  }
-  undef
-}
-
-sub config_get($;$) {
-  my($key,$default)=@_;
-  config_reread() if !%config;
-  defined $config{$key} ? $config{$key} : $default
 }
 
 # --- Generic MySQL database functions
@@ -211,9 +308,8 @@ sub db_transaction($;$) {
 
 # -- movemetafs-specific database routines (mydb_*())
 
-my $all_fs=config_get('all.fs','F'); # !!
+my $all_fs;
 my $all_dev; # st_dev of "$root_prefix/."
-die if 0==length($all_fs);
 
 sub verify_tag($) {
   my($tag)=@_;
@@ -233,6 +329,20 @@ sub verify_tag_query_string($) {
   # ^^^ Imp: allow and remove single quotes (?) for mc(1) cd '...'
   verify_utf8($tag);
   undef
+}
+
+sub mydb_test($) {
+  db_connect();
+  print STDERR "Database connect OK.\n";
+  # vvv !! keep this up-to-date
+  db_do("SELECT principal,shortname, shortprincipal,ino,fs,descr FROM files WHERE 1=2 LIMIT 1");
+  db_do("SELECT ino,fs,tagtxt FROM taggings WHERE 1=2 LIMIT 1");
+  db_do("SELECT ino,fs,tag FROM tags WHERE 1=2 LIMIT 1");
+  db_do("SELECT fs,mpoint,dev,root_ino,top_ino FROM fss WHERE 1=2 LIMIT 1");
+  # vvv Dat: test write access
+  db_do("UPDATE taggings SET ino=ino WHERE 1=2 LIMIT 1");
+  db_do("DELETE FROM taggings WHERE 1=2 LIMIT 1");
+  print STDERR "Tables OK.\n";
 }
 
 sub mydb_insert_tag($) {
@@ -270,18 +380,18 @@ sub mydb_have_tag($) {
   return 0 if $tag=~/\s\Z(?!\n)/;
   # ^^^ Dat: MySQL utf8_general_ci thinks 'foo'='foo ', but we don't want to
   #     find tags with spaces at the end
-  print STDERR "DB_HAVE_TAG($tag)\n" if $DEBUG;
+  print STDERR "DB_HAVE_TAG($tag)\n" if $config{'verbose.level'};
   # Imp: is COUNT(*) faster?
   my $sth=db_query("SELECT 1 FROM tags WHERE tag=? LIMIT 1",$tag);
   my $ret=($sth->fetchrow_array()) ? 1 : 0;
-  print STDERR "DB_HAVE_TAG($tag) = $ret\n" if $DEBUG;
+  print STDERR "DB_HAVE_TAG($tag) = $ret\n" if $config{'verbose.level'};
   $sth->finish();
   $ret
 }
 
 #** @return :List(String) tags
 sub mydb_list_tags() {
-  print STDERR "DB_LIST_TAGS()\n" if $DEBUG;
+  print STDERR "DB_LIST_TAGS()\n" if $config{'verbose.level'};
   # vvv Dat: this would return tags without the fs=''
   #map { $_->[0] } @{db_query_all(
   #  "SELECT tag FROM tags GROUP BY tag ORDER BY tag")}
@@ -329,7 +439,7 @@ sub mydb_gen_shorts($$$) {
 
   my $use_longer_p=($shortprincipal=~m@\A:[0-9a-f]+:@) ? 1 : 0;
   # ^^^ !! is it always correct if our or other shortprincipal starts with m@\A:[0-9a-f]+:@
-  print STDERR "SEARCHING FOR SIMILARS to shortprincipal=($shortprincipal) fs=($fs) ino=$ino.\n" if $DEBUG;
+  print STDERR "SEARCHING FOR SIMILARS to shortprincipal=($shortprincipal) fs=($fs) ino=$ino.\n" if $config{'verbose.level'};
   my $sth=db_query("SELECT fs, ino, shortname FROM files WHERE shortprincipal=? AND NOT (ino=? AND fs=?)",
     $shortprincipal, $ino, $fs);
   my($fs1,$ino1,$shortname0);
@@ -337,13 +447,13 @@ sub mydb_gen_shorts($$$) {
   while (($fs1,$ino1,$shortname0)=$sth->fetchrow_array()) {
     my $shortname1=$shortprincipal;
     $use_longer_p=1;
-    print STDERR "SIMILAR SHORTNAME fs=($fs1) ino=$ino1 $shortname1.\n" if $DEBUG;
+    print STDERR "SIMILAR SHORTNAME fs=($fs1) ino=$ino1 $shortname1.\n" if $config{'verbose.level'};
     my $prepend1=sprintf(":%x:%s:",$ino1,$fs1);
     ##print STDERR "prepend1=$prepend1\n";
     die if length($prepend1)>127;
     substr($shortname1,0,0)=$prepend1; # Dat: not largefile-safe
     shorten_with_ext_bang($shortname1);
-    print STDERR "SIMILAR SHORTNAME CHANGING TO $shortname1.\n" if $DEBUG;
+    print STDERR "SIMILAR SHORTNAME CHANGING TO $shortname1.\n" if $config{'verbose.level'};
     push @sql_updates, ["UPDATE files SET shortname=? WHERE ino=? AND fs=?",
       $shortname1, $ino1, $fs1] if $shortname1 ne $shortname0;
   }
@@ -365,7 +475,7 @@ sub mydb_gen_shorts($$$) {
 #** :String. Empty or ends with slash. May start with slash. Doesn't contain
 #** a double slash. Empty string means current folder.
 #** $root_prefix specifies the real filesystem path to be seen in
-#** "$mpoint/root"
+#** "$config{'mount.point'}/root"
 my $root_prefix='';
 
 #** Also verify_principal().
@@ -384,6 +494,8 @@ sub file_localname_to_fs_ino($;$) {
   my @st;
   die "localname not found\n" unless @st=lstat($root_prefix.$localname);
   die "localname not a file\n" if !$allow_nonfile_p and !-f _;
+  die if !defined($all_fs) or 0==length($all_fs);
+  die if !defined($all_dev);
   die "localname on different filesystem\n" if $st[0] ne $all_dev;
   ($all_fs,$st[1]) # Imp: better than $all_fs
 }
@@ -392,6 +504,8 @@ sub file_localname_to_fs_ino($;$) {
 sub file_st_to_fs_ino($$) {
   my($st_dev,$st_ino)=@_;
   #die "localname not a file\n" if !$allow_nonfile_p and !-f _;
+  die if !defined($all_fs) or 0==length($all_fs);
+  die if !defined($all_dev);
   die "localname on different filesystem\n" if $st_dev ne $all_dev;
   ($all_fs,$st_ino) # Imp: better than $all_fs
 }
@@ -430,7 +544,7 @@ sub mydb_ensure_fs_ino_name($$$) {
 #** @in No tags are associated with the file, tags don't have to be checked.
 sub mydb_delete_from_files_if_no_info($$) {
   my($fs,$ino)=@_;
-  print STDERR "DB_DELETE ino=$ino fs=($fs)\n" if $DEBUG;
+  print STDERR "DB_DELETE ino=$ino fs=($fs)\n" if $config{'verbose.level'};
   db_do("DELETE FROM files WHERE ino=? AND fs=? AND descr=''", $ino, $fs);
   # !! shorten other files with the same shortprincipal
 }
@@ -446,7 +560,7 @@ sub mydb_delete_from_files_if_no_info_and_tags($$) {
 #** Changes files.principal.
 sub mydb_rename_fn($$) {
   my($oldfn,$fn)=@_;
-  print STDERR "DB_RENAME_FN oldfn=($fn) fn=($fn)\n" if $DEBUG;
+  print STDERR "DB_RENAME_FN oldfn=($fn) fn=($fn)\n" if $config{'verbose.level'};
 
   my $oldlocalname=$oldfn;
   die "not a mirrored filename\n" if $oldlocalname!~s@\A/root/+@@;
@@ -464,17 +578,17 @@ sub mydb_rename_fn($$) {
 
   my $rv;
   if ($oldshortprincipal eq $shortprincipal) { # Dat: shortcut: last filename component doesn't change
-    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs)\n" if $DEBUG;
+    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
       $localname, $ino, $fs); # Dat: might have no effect
-    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+    print STDERR "RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
   } else {
     db_transaction(sub {
-      print STDERR "RENAME_FN TO principal=($localname) ino=$ino fs=($fs)\n" if $DEBUG;
+      print STDERR "RENAME_FN TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
       my($shortprincipal,$shortname)=mydb_gen_shorts($localname,$fs,$ino); # Dat: this modifies the db and it might die()
       $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
         $localname, $shortprincipal, $shortname, $ino, $fs); # Dat: might have no effect
-      print STDERR "RENAME_FN TO principal=($localname) shortprincipal=($shortprincipal) shortname=($shortname) ino=$ino fs=($fs) affected=$rv\n" if $DEBUG;
+      print STDERR "RENAME_FN TO principal=($localname) shortprincipal=($shortprincipal) shortname=($shortname) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
     });
   }
   $rv
@@ -495,7 +609,7 @@ sub spec_symlink_get_shortname($) {
 }
 
 #** @param $fn filename to FUSE handler functions (staring with `/', inside
-#**   --mount-point=)
+#**   mount.point=)
 #** @return :String localname (principal for `tag/.../...') or undef
 sub mydb_fn_to_localname($) {
   my($fn)=@_;
@@ -504,7 +618,7 @@ sub mydb_fn_to_localname($) {
   return undef if !defined $shortname;
   my $L=db_query_all("SELECT principal FROM files WHERE shortname=?",
     $shortname);
-  print STDERR "DB_FN_TO_LOCALNAME shortname=($shortname) got=$L (@$L).\n" if $DEBUG;
+  print STDERR "DB_FN_TO_LOCALNAME shortname=($shortname) got=$L (@$L).\n" if $config{'verbose.level'};
   @$L ? $L->[0][0] : undef
 }
 
@@ -520,11 +634,11 @@ sub mydb_op_tag($$) {
     #     GETATTR() anyway, and returned Errno::ENOENT if missing
     die "unknown tag\n" if !@{db_query_all(
       "SELECT 1 FROM tags WHERE tag=? AND ino=0 AND fs='' LIMIT 1", $tag)};
-    print STDERR "DB_OP_TAG localname=($localname) tag=($tag)\n" if $DEBUG;
+    print STDERR "DB_OP_TAG localname=($localname) tag=($tag)\n" if $config{'verbose.level'};
     # Imp: implement file_shortname_to_fs_ino() in addition to
     #      file_localname_to_fs_ino() to avoid extra database access
     my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
-    print STDERR "DB_OP_TAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
+    print STDERR "DB_OP_TAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     mydb_ensure_fs_ino_name($fs,$ino,$localname);
     # vvv Dat: different when row already present
     # vvv Dat: `ON DUPLICATE KEY UPDATE' is better than `REPLACE', because
@@ -534,7 +648,7 @@ sub mydb_op_tag($$) {
     my $rv=db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
       $ino, $fs, $tag);
     mydb_update_taggings_for($fs,$ino) if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
-    print STDERR "DB_OP_TAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
+    print STDERR "DB_OP_TAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $config{'verbose.level'};
   });
 }
 
@@ -545,13 +659,13 @@ sub mydb_op_untag($$) {
   db_transaction(sub { # Imp: is it faster without a transaction?
     my $localname=mydb_fn_to_localname($fn);
     die "not pointing to a mirrored filename\n" if !defined$localname;
-    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag)\n" if $DEBUG;
+    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag)\n" if $config{'verbose.level'};
     my($fs,$ino)=file_localname_to_fs_ino($localname,1); # Dat: this might die()
-    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
+    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     my $rv=($tag eq ':all') ?
       db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
       db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
-    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
+    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $config{'verbose.level'};
     if ($rv or $tag eq ':all') { # actiually removed a tag
       mydb_delete_from_taggings_for($fs,$ino,$tag);
       if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
@@ -564,16 +678,16 @@ sub mydb_op_untag($$) {
 sub mydb_op_untag_shortname($$) {
   my($shortname,$tag)=@_;
   die if !defined $tag;
-  print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag)\n" if $DEBUG;
+  print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag)\n" if $config{'verbose.level'};
   db_transaction(sub { # Imp: is it faster without a transaction?
     my $R=db_query_all("SELECT fs, ino FROM files WHERE shortname=? LIMIT 1", $shortname);
     if (@$R) {
       my($fs,$ino)=@{$R->[0]};
-      print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag) ino=$ino fs=($fs)\n" if $DEBUG;
+      print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
       my $rv=($tag eq ':all') ?
         db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
         db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
-      print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $DEBUG;
+      print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $config{'verbose.level'};
       if ($rv or $tag eq ':all') { # actiually removed a tag
         mydb_delete_from_taggings_for($fs,$ino,$tag);
         if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
@@ -616,7 +730,7 @@ sub tag_to_tagq($) {
 sub mydb_repair_taggings() {
   # !! test with long and lot of tags
   # vvv Dat: no serious need of transaction on `taggings')
-  print STDERR "DB_REPAIR_TAGGINGS\n" if $DEBUG;
+  print STDERR "DB_REPAIR_TAGGINGS\n" if $config{'verbose.level'};
   db_transaction(sub {
     db_do("DELETE FROM taggings WHERE NOT EXISTS (SELECT * FROM tags WHERE ino=taggings.ino AND fs=taggings.fs)");
     #db_do("SET SESSION group_concat_max_len = $db_big_31bit"); # !!
@@ -627,7 +741,7 @@ sub mydb_repair_taggings() {
       SELECT fs, ino, $mydb_concat_tags_sqlpart FROM tags
       WHERE fs<>'' GROUP BY ino, fs
       ON DUPLICATE KEY UPDATE tagtxt=VALUES(tagtxt)");
-    print STDERR "DB_REPAIR_TAGGINGS affected=$rv\n" if $DEBUG;
+    print STDERR "DB_REPAIR_TAGGINGS affected=$rv\n" if $config{'verbose.level'};
   });
 }
 
@@ -644,7 +758,7 @@ sub mydb_delete_from_taggings_for($$$) {
 sub mydb_update_taggings_for($$) {
   my($fs,$ino)=@_;
   # vvv Dat: no serious need of transaction on `taggings')
-  print STDERR "DB_UPDATE_TAGGINGS ino=$ino fs=($fs)\n" if $DEBUG;
+  print STDERR "DB_UPDATE_TAGGINGS ino=$ino fs=($fs)\n" if $config{'verbose.level'};
   db_transaction(sub {
     my $rv="none";
     if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=?", $ino, $fs)}) {
@@ -657,7 +771,7 @@ sub mydb_update_taggings_for($$) {
         WHERE ino=? AND fs=? GROUP by ino, fs
         ON DUPLICATE KEY UPDATE tagtxt=VALUES(tagtxt)", $ino, $fs);
     }
-    print STDERR "DB_UPDATE_TAGGINGS affected=$rv\n" if $DEBUG;
+    print STDERR "DB_UPDATE_TAGGINGS affected=$rv\n" if $config{'verbose.level'};
   }, 1);
 }
 
@@ -675,7 +789,7 @@ sub mydb_rename_tag($$) {
     #     is violated
     my $rv=db_do("UPDATE IGNORE tags SET tag=? WHERE tag=?", $newtag, $oldtag);
     db_do("DELETE FROM tags WHERE tag=?", $oldtag);
-    print STDERR "DB_RENAME_TAG oldtag=($oldtag) newtag=($newtag) affected=($rv)\n" if $DEBUG;
+    print STDERR "DB_RENAME_TAG oldtag=($oldtag) newtag=($newtag) affected=($rv)\n" if $config{'verbose.level'};
     if ($rv) {
       my $oldtagq=tag_to_tagq($oldtag);
       my $newtagq=tag_to_tagq($newtag);
@@ -700,13 +814,13 @@ sub mydb_find_files_matching($) {
     0==length($2) ? tag_to_tagq($1) : $1.$2 @ge; # Dat: $tag_re elsewhere
   my $in_boolean_mode=($qsq=~m@[^\s0-9a-zA-Z_\x80-\xFF]@) ? # Dat: $tag_re elsewhere
     " IN BOOLEAN MODE" : "";
-  print STDERR "DB_FIND_TAGGED_SHORTNAMES$in_boolean_mode qsq=($qsq)\n" if $DEBUG;
+  print STDERR "DB_FIND_TAGGED_SHORTNAMES$in_boolean_mode qsq=($qsq)\n" if $config{'verbose.level'};
   my $ret=db_query_all(
     "SELECT shortname FROM taggings, files WHERE MATCH (tagtxt) AGAINST (?$in_boolean_mode) AND taggings.ino=files.ino AND taggings.fs=files.fs",
     $qsq);
   for my $shortname (@$ret) { $shortname=$shortname->[0] }
   # vvv Dat: search results of 8000 files takes up to 0.3s to transfer -- slow?
-  print STDERR "DB_FIND_TAGGED_SHORTNAMES found ".scalar(@$ret)." files\n" if $DEBUG;
+  print STDERR "DB_FIND_TAGGED_SHORTNAMES found ".scalar(@$ret)." files\n" if $config{'verbose.level'};
   @$ret
 }
 
@@ -749,7 +863,7 @@ sub mydb_file_set_descr($$) {
   verify_utf8($descr);
   $descr=~s@\s+\Z(?!\n)@@;
   $descr=~s@\A\s+@@;
-  print STDERR "DB_FILE_SET_DESCR localname=($localname) descr=($descr)\n" if $DEBUG;
+  print STDERR "DB_FILE_SET_DESCR localname=($localname) descr=($descr)\n" if $config{'verbose.level'};
   db_transaction(sub {
     my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
     mydb_ensure_fs_ino_name($fs,$ino,$localname);
@@ -767,7 +881,7 @@ sub mydb_file_set_tagtxt($$) {
   my @tags;
   while ($tagtxt=~m@(\S+)@g) { push @tags, $1; verify_tag($tags[-1]) }
   db_transaction(sub {
-    print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags)\n" if $DEBUG;
+    print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags)\n" if $config{'verbose.level'};
     # vvv Dat: similar to mydb_file_get_tags()
     my($fs,$ino)=file_localname_to_fs_ino($localname); # Dat: this might die()
     # vvv Dat: works even if `fs--ino' is missing from `files'
@@ -787,7 +901,7 @@ sub mydb_file_set_tagtxt($$) {
         }
         # Imp: implement file_shortname_to_fs_ino() in addition to
         #      file_localname_to_fs_ino() to avoid extra database access
-        print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags) ino=$ino fs=($fs)\n" if $DEBUG;
+        print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
         mydb_ensure_fs_ino_name($fs,$ino,$localname);
         ## vvv Dat: different when row already present
         db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs);
@@ -799,7 +913,7 @@ sub mydb_file_set_tagtxt($$) {
         mydb_update_taggings_for($fs,$ino); # Dat: a if $had_change_p;
       } else { mydb_op_untag($fn,':all') }
     } else {
-      print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags) unchanged\n" if $DEBUG;
+      print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@tags) unchanged\n" if $config{'verbose.level'};
     }
   });
 }
@@ -815,19 +929,19 @@ sub mydb_unlink_last($$$) {
   my($fn,$st_dev,$st_ino)=@_;
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
-  print STDERR "DB_UNLINK_LAST localname=($localname)\n" if $DEBUG;
+  print STDERR "DB_UNLINK_LAST localname=($localname)\n" if $config{'verbose.level'};
   # vvv Dat: too late, deleted.
   my($fs,$ino)=file_st_to_fs_ino($st_dev,$st_ino); # Dat: this might die()
   if (@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
-    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs)\n" if $DEBUG;
+    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     db_transaction(sub {
       my $rv1=db_do(   "DELETE FROM files WHERE ino=? AND fs=?", $ino, $fs);
       my $rv2=db_do(    "DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs);
       my $rv3=db_do("DELETE FROM taggings WHERE ino=? AND fs=?", $ino, $fs);
-      print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) rv=$rv1+$rv2+$rv3\n" if $DEBUG;
+      print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) rv=$rv1+$rv2+$rv3\n" if $config{'verbose.level'};
     });
   } else {
-    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) not-in-files\n" if $DEBUG;
+    print STDERR "DB_UNLINK_LAST localname=($localname) ino=$ino fs=($fs) not-in-files\n" if $config{'verbose.level'};
   }
 }
 
@@ -861,7 +975,7 @@ sub diemsg_to_nerrno() {
   return 0 if !$@;
   my $msg=$@;
   chomp($msg);
-  print STDERR "info: diemsg: $msg\n" if $DEBUG;
+  print STDERR "info: diemsg: $msg\n" if $config{'verbose.level'};
   $msg=~s@(?::\s|\n).*@@s;
   ($dienerrnos{$msg} or -1*Errno::EPERM)
 }
@@ -869,18 +983,12 @@ sub diemsg_to_nerrno() {
 
 # ---
 
-#** Absolute dir. Starts with slash. Doesn't end with slash. Doesn't contain
-#** a double slash. Isn't "/".
-my $mpoint;
-
-my $read_only_p=0;
-
 # vvv Dat: SUXX: cannot kill processes using the mount point
 #     Dat: cannot reconnect
 #my @do_umount;
 sub cleanup_umount() {
-  if (defined $mpoint) {
-    system('fusermount -u -- '.fnq($mpoint).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts
+  if (defined $config{'mount.point'}) {
+    system('fusermount -u -- '.fnq($config{'mount.point'}).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts
   }
 }
 
@@ -907,7 +1015,7 @@ END { cleanup_umount(); }
 
 #** Removes /root/, prepends $root_prefix.
 #** @return undef if not starting with root (or if result would start with
-#**   $mpoint); filename otherwise
+#**   $config{'mount.point'}); filename otherwise
 sub sub_to_real($) {
   my $fn=$_[0];
   return undef if $fn!~s@\A/root(?=/|\Z(?!\n))@@;
@@ -915,6 +1023,7 @@ sub sub_to_real($) {
   substr($fn,0,0)=(0==length($root_prefix)) ? '.' : $root_prefix;
   $fn="/" if 0==length($fn);
   #print STDERR "SUB_TO_REAL() real=$fn\n";
+  my $mpoint=$config{'mount.point'};
   return (substr($fn,0,length($mpoint)) eq $mpoint and
     (length($fn)==length($mpoint) or substr($fn,length($mpoint),1)eq"/") ) ?
     undef : $fn
@@ -959,7 +1068,7 @@ sub my_getattr($) {
   # Dat: no problem of faking a setuid bit: fusermount is nosuid by default
   my $fn=$_[0];
   my $real;
-  print STDERR "GETATTR($fn)\n" if $DEBUG;
+  print STDERR "GETATTR($fn)\n" if $config{'verbose.level'};
   my $dev=3; # Dat: fake /proc
   my $ino=0; # Dat: the "ino" field is currently ignored.
   my $mode=0755|S_IFDIR;
@@ -976,7 +1085,7 @@ sub my_getattr($) {
   if ($fn eq '/') {
   # vvv Dat: top level dirs have high priority, because getattr(2) is called for them
   } elsif ($fn eq '/tag' or $fn eq '/untag' or $fn eq '/tagged',
-    or $fn eq '/search') {
+    or $fn eq '/search' or $fn eq '/adm') {
   } elsif ($fn eq '/root') {
   } elsif (defined($real=sub_to_real($fn))) {
     # Dat: rofs also uses lstat() instead of stat()
@@ -1007,7 +1116,7 @@ sub my_getattr($) {
     #return -1*Errno::ENOENT if !mydb_have_tag($subdir); # Dat: checked by the previous call, but could be changed since then...)
     $mode=($mode&0644)|S_IFLNK;
   } else {
-    # Imp: Errno::EACCES for $mount_point/$mount_point
+    # Imp: Errno::EACCES for $config{'mount.point'}/$config{'mount.point'}
     return -1*Errno::ENOENT;
   }
   ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)
@@ -1019,10 +1128,10 @@ sub my_getdir($) {
   my $dir=$_[0];
   my $real;
   my $D;
-  print STDERR "GETDIR($dir)\n" if $DEBUG;
+  print STDERR "GETDIR($dir)\n" if $config{'verbose.level'};
   if ($dir eq '/') {
     # Dat: we need '.' and '..' for both / and others
-    return ('.','..','root','search','tag','untag','tagged', 0); # $errno
+    return ('.','..','root','search','tag','untag','tagged','adm', 0); # $errno
   } elsif ($dir eq '/tag' or $dir eq '/untag' or $dir eq '/tagged') {
     my @L=eval { mydb_list_tags() };
     return diemsg_to_nerrno() if $@;
@@ -1042,8 +1151,10 @@ sub my_getdir($) {
     my @L=eval { mydb_find_tagged_shortnames($1) };
     return diemsg_to_nerrno() if $@;
     return ('.','..',@L, 0);
-  } elsif ($dir eq '/search' or $dir eq '/untag/:all') {
+  } elsif ($dir eq '/search' or $dir eq '/untag/:all' or $dir eq '/adm') {
     return ('.','..',0);
+  } elsif ($dir eq '/adm') {
+  
   } elsif (!defined($real=sub_to_real($dir))) {
     # Dat: getdents64() returns ENOENT, but open(...O_DIRECTORY) succeeds
     return -1*Errno::ENOENT; # Imp: probably ENOTDIR
@@ -1063,8 +1174,8 @@ sub my_open($$) {
   # SUXX: permission denied for other users' files (with FUSE mount...)
   # Dat: O_CREAT | O_EXCL | O_TRUNC is not passed.
   my($fn,$flags)=@_;
-  print STDERR "OPEN($fn,$flags)\n" if $DEBUG;
-  return -1*Errno::EROFS if $read_only_p and ($flags&O_ACCMODE)!=O_RDONLY;
+  print STDERR "OPEN($fn,$flags)\n" if $config{'verbose.level'};
+  return -1*Errno::EROFS if $config{'read.only.p'} and ($flags&O_ACCMODE)!=O_RDONLY;
   #print "OPEN_OK\n";
   return 0
 }
@@ -1074,7 +1185,7 @@ sub my_read($$$) {
   my $real;
   my $F;
   #$offset=0 if !defined $offset;
-  print STDERR "READ($fn,$size,$offset)\n" if $DEBUG;
+  print STDERR "READ($fn,$size,$offset)\n" if $config{'verbose.level'};
   # ^^^ Dat: maximum size for FUSE READ() seems to be 131072 bytes
   # $size=999 if $size>999; # Dat: bad, short read not allowed, application
   # still received original $size
@@ -1103,7 +1214,7 @@ sub my_mknod($$$) {
   my $F;
   my $got;
   #$offset=0 if !defined $offset;
-  print STDERR "MKNOD($fn,$mode,$rdev)\n" if $DEBUG;
+  print STDERR "MKNOD($fn,$mode,$rdev)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM;
 #  } elsif (($mode&S_IFREG)!=0) {
@@ -1125,7 +1236,7 @@ sub my_write($$$) {
   my $real;
   my $F;
   #$offset=0 if !defined $offset;
-  print STDERR "WRITE($fn,".length($S).",$offset)\n" if $DEBUG;
+  print STDERR "WRITE($fn,".length($S).",$offset)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM; # can we return this?
   } elsif (!sysopen($F,$real,O_WRONLY)) { # Dat: no need for O_CREAT, already checked
@@ -1147,7 +1258,7 @@ sub my_write($$$) {
 sub my_unlink($) {
   my($fn)=@_;
   my $real;
-  print STDERR "UNLINK($fn)\n" if $DEBUG;
+  print STDERR "UNLINK($fn)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(?:tagged)/([^/]+)/([^/]+)\Z(?!\n)@) {
       my $tag=$1; my $shortname=$2;
@@ -1179,7 +1290,7 @@ sub my_unlink($) {
 sub my_rmdir($) {
   my($fn)=@_;
   my $real;
-  print STDERR "RMDIR($fn)\n" if $DEBUG;
+  print STDERR "RMDIR($fn)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(?:tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
       my $tag=$1;
@@ -1206,13 +1317,13 @@ sub my_mkdir($$) {
   my($fn,$mode)=@_;
   my $real;
   # Dat: FUSE calls: GETATTR(), MKDIR(), GETATTR()
-  print STDERR "MKDIR($fn,$mode)\n" if $DEBUG;
+  print STDERR "MKDIR($fn,$mode)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(?:tag|untag|tagged)/([^/]+)\Z(?!\n)@) {
       my $tag=$1;
       eval { mydb_insert_tag($tag); };
       return diemsg_to_nerrno();
-    } elsif ($fn eq '/repair_taggings') {
+    } elsif ($fn eq '/adm/repair_taggings') {
       eval { mydb_repair_taggings(); };
       return diemsg_to_nerrno();
       # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
@@ -1229,7 +1340,7 @@ sub my_mkdir($$) {
 sub my_chmod($$) {
   my($fn,$mode)=@_;
   my $real;
-  print STDERR "CHMOD($fn,$mode)\n" if $DEBUG;
+  print STDERR "CHMOD($fn,$mode)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM
   } elsif (!chmod($mode,$real)) {
@@ -1242,7 +1353,7 @@ sub my_chmod($$) {
 sub my_chown($$$) {
   my($fn,$uid,$gid)=@_;
   my $real;
-  print STDERR "CHOWN($fn,$uid,$gid)\n" if $DEBUG;
+  print STDERR "CHOWN($fn,$uid,$gid)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM
   } elsif (!chown($uid,$gid,$real)) {
@@ -1255,7 +1366,7 @@ sub my_chown($$$) {
 sub my_utime($$$) {
   my($fn,$atime,$mtime)=@_;
   my $real;
-  print STDERR "UTIME($fn,$atime,$mtime)\n" if $DEBUG;
+  print STDERR "UTIME($fn,$atime,$mtime)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM
   } elsif (!utime($atime,$mtime,$real)) {
@@ -1268,7 +1379,7 @@ sub my_utime($$$) {
 sub my_symlink($$) {
   my($target,$fn)=@_;
   my $real;
-  print STDERR "SYMLINK($target,$fn)\n" if $DEBUG;
+  print STDERR "SYMLINK($target,$fn)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM
   } elsif (!symlink($target,$real)) {
@@ -1281,7 +1392,7 @@ sub my_symlink($$) {
 sub my_link($$) {
   my($oldfn,$fn)=@_;
   my($oldreal,$real);
-  print STDERR "LINK($oldfn,$fn)\n" if $DEBUG;
+  print STDERR "LINK($oldfn,$fn)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM
   } elsif (!defined($oldreal=sub_to_real($oldfn))) {
@@ -1296,7 +1407,7 @@ sub my_link($$) {
 sub my_rename($$) {
   my($oldfn,$fn)=@_;
   my($oldreal,$real);
-  print STDERR "RENAME($oldfn,$fn)\n" if $DEBUG;
+  print STDERR "RENAME($oldfn,$fn)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(tag|untag|tagged)/([^/]+)/[^/]+\Z(?!\n)@) {
       # Dat: mydb_op_tag() and mydb_op_untag() verify if $oldfn is a mirrored filename,
@@ -1328,7 +1439,7 @@ sub my_readlink($) {
   my($fn)=@_;
   my $real;
   my $ret;
-  print STDERR "READLINK($fn)\n" if $DEBUG;
+  print STDERR "READLINK($fn)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     #print STDERR "RR $fn\n";
     my $shortname=spec_symlink_get_shortname($fn);
@@ -1351,7 +1462,7 @@ sub my_readlink($) {
 sub my_truncate($$) {
   my($fn,$tosize)=@_;
   my $real;
-  print STDERR "TRUNCATE($fn,$tosize)\n" if $DEBUG;
+  print STDERR "TRUNCATE($fn,$tosize)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
     return -1*Errno::EPERM
   } elsif (!truncate($real,$tosize)) {
@@ -1362,25 +1473,25 @@ sub my_truncate($$) {
 }
 
 sub my_statfs() {
-  print STDERR "STATFS()\n" if $DEBUG;
+  print STDERR "STATFS()\n" if $config{'verbose.level'};
   return -1*Errno::ENOANO;
 }
 
 sub my_flush($) {
   my($fn)=$_[0];
-  print STDERR "FLUSH($fn)\n" if $DEBUG;
+  print STDERR "FLUSH($fn)\n" if $config{'verbose.level'};
   return 0;
 }
 
 sub my_fsync($) {
   my($fn)=$_[0];
-  print STDERR "FSYNC($fn)\n" if $DEBUG;
+  print STDERR "FSYNC($fn)\n" if $config{'verbose.level'};
   return 0;
 }
 
 sub my_release($$) {
   my($fn,$flags)=@_;
-  print STDERR "RELEASE($fn)\n" if $DEBUG;
+  print STDERR "RELEASE($fn)\n" if $config{'verbose.level'};
   return 0;
 }
 
@@ -1389,7 +1500,7 @@ sub my_listxattr($) {
   my($fn)=@_;
   my $real;
   my @attrs;
-  print STDERR "LISTXATTR($fn)\n" if $DEBUG;
+  print STDERR "LISTXATTR($fn)\n" if $config{'verbose.level'};
   # Dat: getfattr(1) `getfattr -d' needs the "user.mmfs." prefix
   if ($fn eq '/root' or !defined($real=sub_to_real($fn))) {
     # Dat: `meta/root' is also a fakenode, since it doesn't have a valid
@@ -1434,7 +1545,7 @@ sub my_getxattr_low($$) {
 
 sub my_getxattr($$) {
   my($fn,$attrname)=@_;
-  print STDERR "GETXATTR($fn,$attrname)\n" if $DEBUG;
+  print STDERR "GETXATTR($fn,$attrname)\n" if $config{'verbose.level'};
   my_getxattr_low($fn,$attrname)
 }
 
@@ -1463,7 +1574,7 @@ sub my_setxattr_low($$$$) {
 
 sub my_setxattr($$$$) {
   my($fn,$attrname,$attrval,$flags)=@_;
-  print STDERR "SETXATTR($fn,$attrname,$attrval,$flags)\n" if $DEBUG;
+  print STDERR "SETXATTR($fn,$attrname,$attrval,$flags)\n" if $config{'verbose.level'};
   my_setxattr_low($fn,$attrname,$attrval,$flags)
 }
 
@@ -1471,7 +1582,7 @@ sub my_setxattr($$$$) {
 #** Dat: `setfattr -x attrname filename'
 sub my_removexattr($$) {
   my($fn,$attrname)=@_;
-  print STDERR "REMOVEXATTR($fn,$attrname)\n" if $DEBUG;
+  print STDERR "REMOVEXATTR($fn,$attrname)\n" if $config{'verbose.level'};
   my_setxattr_low($fn,$attrname,"",0); # Imp: smarter
   # vvv Imp: disinguish "0" and 0 (with Scalar::Util?)
   #if (my_getxattr_low($fn,$attrname)eq"0") { # Dat: no such attribute
@@ -1483,53 +1594,35 @@ sub my_removexattr($$) {
 
 # --- main()
 
-{ my $I;
-  for ($I=0;$I<@ARGV;$I++) {
-    if ($ARGV[$I] eq'-' or substr($ARGV[$I],0,1)ne'-') { last }
-    elsif ($ARGV[$I] eq '--') { $I++; last }
-    elsif ($ARGV[$I] eq '--read-only=0') { $read_only_p=0 } # Dat: default
-    elsif ($ARGV[$I] eq '--read-only=1') { $read_only_p=1 }
-    elsif ($ARGV[$I] eq '--verbose') { $DEBUG++ }
-    elsif ($ARGV[$I] eq '--quiet'  ) { $DEBUG-- }
-    elsif ($ARGV[$I]=~/--mount-point=(.*)/s) { $mpoint=$1 }
-    elsif ($ARGV[$I]=~/--root-prefix=(.*)/s) { $root_prefix=$1 }
-    elsif ($ARGV[$I] eq '--version') {
-      print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.14 2007-01-07 15:25:17 pts Exp $'."\n";
-      print STDERR "by Pe'ter Szabo' since early January 2007\n";
-      print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
-      exit 0
-    }
-    elsif ($ARGV[$I] eq '--help') { die "$0: no --help, see README.txt\n" }
-    else { die "$0: unknown option: $ARGV[$I]\n" }
-  }
-  splice @ARGV, 0, $I;
-  die "$0: extra args\n" if @ARGV;
-}
-die "$0: missing --mount-point=, see README.txt\n" if !defined $mpoint or 0==length($mpoint);
-die "$0: cannot find mpoint\n" if !defined($mpoint=Cwd::abs_path($mpoint)) or
-  substr($mpoint,0,1)ne"/" or length($mpoint)<2 or $mpoint=~m@//@;
-#print STDERR "D".(-d $mpoint);
+die "config already read\n" if @config_argv;
+config_reread();
+
+die "$0: extra args: @ARGV\n" if "@ARGV" ne "--";
+die "$0: empty config key mount.point, see README.txt\n" if 0==length($config{'mount.point'});
+die "$0: cannot find mount.point\n" if !defined($config{'mount.point'}=Cwd::abs_path($config{'mount.point'})) or
+  substr($config{'mount.point'},0,1)ne"/" or length($config{'mount.point'})<2 or $config{'mount.point'}=~m@//@;
+#print STDERR "D".(-d $config{'mount.point'});
 # vvv SUXX: it works only every 2nd time because of fusermount stale etc.
-my @L=lstat($mpoint);
+my @L=lstat($config{'mount.point'});
 #print STDERR "$!..\n" if !@L;
 if ((@L or $! !=Errno::ENOTCONN) and !(-d _)) {
-  die "$0: cannot create mpoint $mpoint: $!\n" if !mkdir($mpoint);
+  die "$0: cannot create mount.point $config{'mount.point'}: $!\n" if !mkdir($config{'mount.point'});
 }
 
 $root_prefix=~s@//+@/@g;
 $root_prefix=~s@/*\Z(?!\n)@/@;
 $root_prefix=~s@\A/+@/@;
+$all_fs=config_get('default.fs','F'); # !!
 { my @st=lstat("$root_prefix/.");
   die "$0: cannot stat --root-prefix=: $root_prefix\n" if !@st;
   $all_dev=$st[0];
   #die "all_dev=$all_dev\n";
 }
-
 db_connect();
 
-system('fusermount -u -- '.fnq($mpoint).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts
-print STDERR "starting Fuse::main on --mount-point=$mpoint\n" if $DEBUG;
-print STDERR "Press Ctrl-<C> to exit (and then umount manually).\n" if $DEBUG;
+system('fusermount -u -- '.fnq($config{'mount.point'}).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts
+print STDERR "starting Fuse::main on mount.point=$config{'mount.point'}\n" if $config{'verbose.level'};
+print STDERR "Press Ctrl-<C> to exit (and then umount manually).\n" if $config{'verbose.level'};
 # vvv Dat: it is also OK to use "Fuse::Demo::my_getattr" instead of
 #     \&my_getattr, but now it is more typesafe.
 my @ro_ops=(
@@ -1563,12 +1656,12 @@ my @write_ops=(
   removexattr=>\&my_removexattr, # !ro
 );
 
-Fuse::main(mountpoint=>$mpoint,
+Fuse::main(mountpoint=>$config{'mount.point'},
   #mountopts=>'allow_other', # etc., echo user_allow_other >>/etc/fuse.conf
   #mountopts=>'user_xattr', # Dat: not possible to pass user_xattr here...
   #treaded=>0, # Dat: threaded=>1 needs ithreads and precautions
   @ro_ops,
-  ($read_only_p ? () : @write_ops),
+  ($config{'read.only.p'} ? () : @write_ops),
 );
 # ^^^ Dat: might die with:
 #     fusermount: fuse device not found, try 'modprobe fuse' first
