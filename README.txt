@@ -257,10 +257,10 @@ functionality of these special folders can be used from any file manager
 (recommended: Midnight Commander), the exact way how to do it is documented
 later.
 
-movemetafs stores metainformation (such as which file has what tags
-associated to it) in a MySQL database, which can be located anywhere: any
-folder on the local machine, or even on a remote host. A remote host is not
-recommended, though, because network transmission might be slow.
+movemetafs stores metadata (== metainformation; such as which file has what
+tags associated to it) in a MySQL database, which can be located anywhere:
+any folder on the local machine, or even on a remote host. A remote host is
+not recommended, though, because network transmission might be slow.
 
 Warning about moving files: If you want to move a file within the filesystem
 (or remove a file), do it in meta/root, not directly on the carrier. That's
@@ -399,13 +399,14 @@ The most important configuration entries for movemetafs:
    messages printed by `mmfs_fuse.pl'. Use `1' to get all the
    debug messages, use `0' to suppress most (and make operation a little
    faster).
--- mount.point (mandatory, no default): folder writable by you to which the
+-- mount.point (mandatory, default is "$ENV{HOME}/mmfs"):
+   folder writable by you to which the
    meta filesystem is mounted, i.e. `meta/root' will be `<dir>/root' if
    `mount.point=<dir>'. You may have to create this folder manually before
    starting `mmfs_fuse.pl'. Because of how FUSE works, other users on
    the system (`root' included) won't be able to see into this folder once the
    meta filesystem is mounted.
--- root.prefix (mandatory, empty): the carrier filesystem folder, this will
+-- root.prefix (default: '/'): the carrier filesystem folder, this will
    be visible as `meta/root'. Can be absolute or relative (to the current
    folder of the `mmfs_fuse.pl' program invocation).
 
@@ -521,6 +522,9 @@ Special operations with files in meta/root:
    `user.mmfs.tags'. An attempt to modify another attribute succeeds if the old
    and new values are the same, and returns `Operation not permitted'
    otherwise.
+-- There is also the write-only attribute `user.mmfs.tags.tag' to add tags
+   (in the value, separated by whitespace) and `user.mmfs.tags.untag' to
+   remove tags.
 
 Some of the operations above are markes with `Safe only in meta filesystem.'
 This means that these operations should not be performed on the carrier
@@ -682,6 +686,22 @@ Special folders are:
       on the carrier filesystem), or if it is desired to change the
       principal name of a tagged file with multiple hard links. Read more
       in ``Principal name''.
+   -- The folder `meta/adm/fixunlink' appears to be empty. If a file
+      is moved here from `meta/root', all metadata movemetafs knows about
+      the file and its hard links (including tags, description and principal)
+      is forgotten. If the specified name is a principal name of a file
+      (with any inode number), all information is removed
+      from that file, too.
+
+      Please note that this tool is a little dangerous since it
+      removes metadata.
+   -- `meta/adm/fixunlinkino:<dev>,<ino>' (where <dev> is a hexadecimal
+      st_dev number and <ino> is a hexadecimal st_ino number of the same
+      file) is a missing directory. When attemted to be created, all
+      metadata movemetafs knows about the file (speficied by <dev>,<ino>)
+      and its hard links is forgotten (and `No such file or directory'
+      is returned). This tool can be used to forcibly remove stale inodes
+      from the database.
    -- `meta/adm/purgeallmeta' is a missing directory. When it is attempted
       to be created, all tags and descriptions in the metadata store are
       permanently erased (and `No such file or directory' is returned).
@@ -1035,6 +1055,7 @@ possible, and send your report in e-mail to Péter Szabó <pts@fazekas.hu>.
 
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
+!! feature: tag alias symlinks
 !! test: rename across mount points with GNU mv(1). GNU mv(1) doesn't seem
    to preserve extended attributes
 !! doc: more about the GQview patch
@@ -1175,5 +1196,18 @@ Improvement possibilites
    <- mv /tmp/mp/tagged/food/b /tmp/mp/root/proba/c
 !! feature: rename fs in fss
 !! measure: do we need the %dev_to_fss cache?
+!! feature: add two tags: move to "meta/tag/dance upskirt"
+!! feature: recursive carrier watch with inotify or fschange
+!! feature: find by principal without stat() -- is that faster?
+!! SUXX: Midnight Commander cannot create multiple symlinks at once
+!! feature: Midnight Commander menu integration
+!! doc: strange: search for 'foo bar' -- it is 'foo' or `bar'
+!! fix: move bride to wedding (rename tag)
+!! fix: move from tagged/a/ to tagged/b/
+!! doc: rfsdelta
+!! doc: metainformation -> metadata
+!! test: are prepred statements processen on the client side or in the
+   MySQL server?
+!! feature: remove stale `meta/search/*' symlinks with `meta/adm/fixunlink'
 
 __END__
