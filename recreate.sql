@@ -33,6 +33,9 @@ DROP TABLE IF EXISTS files;
 -- Dat: fs can contain only ASCII (0..127) chars, except for `:'
 -- Dat: it is good that the UNIQUE property of shortname is checked by MySQL
 -- Dat: both Linux and MySQL have a limit of 255 in filenames (for shortname)
+-- Dat: `ts' is last (re)insertion time. Please note that file gets removed
+--      if it loses all its tags and descr.
+-- Dat: `ts' is in GMT, it shouldn't be local time
 -- SUXX: cannot add a UNIQUE index on a VARCHAR(256) column...
 -- SUXX: `Specified key was too long; max key length is 767 bytes' (for UNIQUE indexes),
 --       so we avoid UNIQUE indexes
@@ -42,10 +45,12 @@ CREATE TABLE files (
   shortprincipal VARBINARY(255) NOT NULL,
   ino INTEGER UNSIGNED NOT NULL,
   fs VARBINARY(127) NOT NULL,
+  ts TIMESTAMP NOT NULL DEFAULT NOW(),
   descr TEXT NOT NULL,
   INDEX(shortprincipal),
   INDEX(principal(32000)),
-  UNIQUE(ino,fs)
+  UNIQUE(ino,fs),
+  INDEX(ts),
 ) ENGINE=InnoDB;
 
 -- Dat: tagtxt: `q' or something else is appended to words separated by space,
@@ -61,13 +66,17 @@ CREATE TABLE taggings (
 
 -- Dat: each tag has a row here with ino==0 and fs==''
 --      no matter if there are files associated to the tag or not
+-- Dat: `ts' is last insertion time, not last retag time
+-- Dat: `ts' is in GMT, it shouldn't be local time
 DROP TABLE IF EXISTS tags;
 CREATE TABLE tags (
   ino INTEGER UNSIGNED NOT NULL,
   fs VARBINARY(127) NOT NULL,
   tag VARCHAR(255),
+  ts TIMESTAMP NOT NULL DEFAULT NOW(),
   UNIQUE(tag,ino,fs),
-  UNIQUE(ino,fs,tag)
+  UNIQUE(ino,fs,tag),
+  INDEX(ts)
 ) ENGINE=InnoDB;
 
 -- Imp: what if sizeof(st_ino)>sizeof(INTEGER)?

@@ -110,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.23 2007-01-12 14:15:02 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.24 2007-01-12 21:07:07 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -1084,11 +1084,14 @@ sub mydb_file_set_descr($$) {
   });
 }
 
+#** Dat: changes tags.ts only for the tags that were missing and just got
+#**      added.
 #** @param $setmode 'set', 'tag', 'untag' or 'modify'
 #** @return :String or undef (if file is not tagged)
 sub mydb_file_set_tagtxt($$$) {
   my($fn,$tagtxt,$setmode)=@_;
   my $localname=$fn;
+  my $all_tags={};
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
   print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tagtxt=($tagtxt) setmode=($setmode)\n" if $config{'verbose.level'};
   if ($setmode eq 'modify') {
@@ -1098,78 +1101,114 @@ sub mydb_file_set_tagtxt($$$) {
       while ($tagtxt=~m@(\S+)@g) {
         my $tag=$1;
         if ($tag=~s@\A-@@) { push @tags_to_untag, $tag }
-        else { push @tags_to_tag, $tag }
+        else { $tag=~s@\A[+]@@; push @tags_to_tag, $tag }
         verify_tag($tag)
       }
-      # vvv Imp: together in a transaction
-      # vvv Dat: run 'tag' first to avoid early DB_DELETE on 'untag'
-      mydb_file_set_tags_low($fn,$localname,\@tags_to_tag,'tag');
-      mydb_file_set_tags_low($fn,$localname,\@tags_to_untag,'untag');
+      my %hash_to_tag=map { $_ => 1 } @tags_to_tag;
+      my @both_tag=grep { exists $hash_to_tag{$_} } @tags_to_untag;
+      #my @both_tag=(1,2,3);
+      die "tag both to be added and removed: @{[sort@both_tag]}\n" if
+        @both_tag;
+      db_transaction(sub {
+        # vvv Dat: run 'tag' first to avoid early DB_DELETE on 'untag'
+        my($fs,$ino)=(!@tags_to_tag ?
+          mydb_file_localname_to_fs_ino($localname,1,1) :
+          mydb_file_localname_to_fs_ino($localname)); # Dat: this might die()
+        if (!defined $fs) {
+          print STDERR "DB_FILE_SET_TAGTXT localname=($localname) unknown fs\n";
+        } else {
+          # Dat: we don't `SELECT tag FROM tags WHERE ino=...' here, it is
+          #      superfluous
+          mydb_file_set_tags_low($fn,$localname,\@tags_to_tag,'tag',$fs,$ino,$all_tags);
+          mydb_file_set_tags_low($fn,$localname,\@tags_to_untag,'untag',$fs,$ino,$all_tags);
+        }
+      },1) if @tags_to_tag or @tags_to_untag;
     } else { mydb_op_untag($fn,':all') }
-  } else {
+  } elsif ($setmode eq 'set') {
     my @tags;
     while ($tagtxt=~m@(\S+)@g) { push @tags, $1; verify_tag($tags[-1]) }
-    mydb_file_set_tags_low($fn,$localname,\@tags,$setmode);
+    if (@tags) {
+      db_transaction(sub {
+        my($fs,$ino)=mydb_file_localname_to_fs_ino($localname);
+        # vvv Dat: similar to mydb_file_get_tags()
+        my @old_tags=(map { $_->[0] } @{db_query_all(
+          "SELECT tag FROM tags WHERE ino=? AND fs=?",
+          $ino, $fs)});
+        print STDERR "DB_FILE_SET_TAGTXT old tags on file=(@old_tags)\n" if $config{'verbose.level'};
+        if (join(' ', sort@tags) ne join(' ', sort@old_tags)) {
+          my %hash_old_tag=map { $_ => 1 } @old_tags;
+          my %hash_new_tag=map { $_ => 1 } @tags;
+          # vvv Dat: we filter so we won't change existing tags.ts timestamp
+          my @tags_to_tag=  grep { !exists $hash_old_tag{$_}} @tags;
+          my @tags_to_untag=grep { !exists $hash_new_tag{$_}} @old_tags;
+          mydb_file_set_tags_low($fn,$localname,\@tags_to_tag,'tag',$fs,$ino,$all_tags);
+          mydb_file_set_tags_low($fn,$localname,\@tags_to_untag,'untag',$fs,$ino,$all_tags);
+        }
+      });
+    } else { mydb_op_untag($fn,':all') }
+  } else {
+    die "bad setmode: $setmode\n" if
+      $setmode ne 'tag' and $setmode ne 'untag';
+    if ($setmode ne 'untag' or $tagtxt!~m@\A\s*-:all\s*\Z(?!\n)@) {
+      my @tags;
+      while ($tagtxt=~m@(\S+)@g) { push @tags, $1; verify_tag($tags[-1]) }
+      db_transaction(sub {
+        my($fs,$ino)=($setmode eq 'untag' ?
+          mydb_file_localname_to_fs_ino($localname,1,1) :
+          mydb_file_localname_to_fs_ino($localname)); # Dat: this might die()
+        if (!defined $fs) {
+          print STDERR "DB_FILE_SET_TAGTXT localname=($localname) unknown fs\n";
+        } else {
+          mydb_file_set_tags_low($fn,$localname,\@tags,$setmode,$fs,$ino,$all_tags);
+        }
+      });
+    } else { mydb_op_untag($fn,':all') }
   }
 }
 
-sub mydb_file_set_tags_low($$$$) {
-  my($fn,$localname,$tags,$setmode)=@_;
-  if (@$tags) {}
-  elsif ($setmode eq 'set') { $tags=[':all']; $setmode='untag' }
-  else { return }
-  return mydb_op_untag($fn,':all') if $setmode eq 'untag' and
-    grep { $_ eq ':all' } @$tags;
-  # Dat: now @$tags is not empty
-  db_transaction(sub {
-    print STDERR "DB_FILE_SET_TAGTXT_LOW localname=($localname) tags=(@$tags) setmode=($setmode)\n" if $config{'verbose.level'};
-    # vvv Dat: similar to mydb_file_get_tags()
-    my($fs,$ino)=($setmode eq 'untag' ?
-      mydb_file_localname_to_fs_ino($localname,1,1) :
-      mydb_file_localname_to_fs_ino($localname)); # Dat: this might die()
-    my @old_tags=(defined$fs ? map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
-      $ino, $fs)} : ());
-    if (!defined $fs) {
-      print STDERR "DB_FILE_SET_TAGTXT_LOW localname=($localname) unknown fs\n";
-    } elsif ($setmode ne 'set' or join(' ', sort@$tags) ne join(' ', sort@old_tags)) {
-      # Dat: works even if `fs--ino' is missing from `files'
-      # Imp: DELETE and INSERT only the difference
-      # Dat: no problem if duplicates in @$tags
-      # Imp: optimize, remove duplicates
-      { my %all_tags;
-        # vvv Imp: don't cache statement, and use subset of @$tags
-        for my $row (@{db_query_all("SELECT tag FROM tags WHERE ino=0 AND fs=''")}) {
-          $all_tags{$row->[0]}=1
-        }
-        for my $tag (@$tags) { die "unknown tag: $tag\n" if !defined $all_tags{$tag} }
-      }
-      # Imp: implement file_shortname_to_fs_ino() in addition to
-      #      mydb_file_localname_to_fs_ino() to avoid extra database access
-      print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@$tags) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-      mydb_ensure_fs_ino_name($fs,$ino,$localname);
-      ## vvv Dat: different when row already present
-      if ($setmode eq 'untag') {
-        for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
-          db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?",
-            $ino, $fs, $tag);
-          #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
-        }
-        # vvv Dat: `_and_tags' is very important
-        mydb_delete_from_files_if_no_info_and_tags($fs,$ino);
-      } else {
-        db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) if
-          $setmode eq 'set';
-        for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
-          db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
-            $ino, $fs, $tag);
-          #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
-        }
-      }
-      mydb_update_taggings_for($fs,$ino); # Dat: a if $had_change_p;
-    } else {
-      print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@$tags) unchanged\n" if $config{'verbose.level'};
+#** Dat: changes tags.ts only for the tags that were missing and just got
+#**      added.
+#** Dat: must be called from within a transaction
+#** @param $setmode 'tag' or 'untag'
+sub mydb_file_set_tags_low($$$$$$$) {
+  my($fn,$localname,$tags,$setmode,$fs,$ino,$all_tags)=@_;
+  return if !@$tags;
+  print STDERR "DB_FILE_SET_TAGTXT_LOW localname=($localname) tags=(@$tags) setmode=($setmode)\n" if $config{'verbose.level'};
+  # vvv Dat: similar to mydb_file_get_tags()
+  # Dat: works even if `fs--ino' is missing from `files'
+  # Imp: DELETE and INSERT only the difference
+  # Dat: no problem if duplicates in @$tags
+  # Imp: optimize, remove duplicates
+  # Imp: maybe allow removing arbitrary (unknown) tags? Not yet.
+  if (!%$all_tags) { # Imp: speedup if no tags at all
+    # vvv Imp: don't cache statement, and use subset of @$tags
+    for my $row (@{db_query_all("SELECT tag FROM tags WHERE ino=0 AND fs=''")}) {
+      $all_tags->{$row->[0]}=1
     }
-  },1);
+  }
+  for my $tag (@$tags) { die "unknown tag: $tag\n" if !defined $all_tags->{$tag} }
+  # Imp: implement file_shortname_to_fs_ino() in addition to
+  #      mydb_file_localname_to_fs_ino() to avoid extra database access
+  print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@$tags) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+  ## vvv Dat: different when row already present
+  if ($setmode eq 'untag') {
+    # Imp: remove duplicates from @$tags
+    for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
+      db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?",
+        $ino, $fs, $tag);
+      #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
+    }
+    # vvv Dat: `_and_tags' is very important
+    mydb_delete_from_files_if_no_info_and_tags($fs,$ino);
+  } else {
+    mydb_ensure_fs_ino_name($fs,$ino,$localname);
+    for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
+      db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
+        $ino, $fs, $tag);
+      #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
+    }
+  }
+  mydb_update_taggings_for($fs,$ino); # Dat: a if $had_change_p;
 }
 
 #** Is unlink OK if $fn has multiple hard links?
@@ -1338,7 +1377,9 @@ sub file_stat_localname_is($$$) {
 my %dienerrnos=(
   'bad tag' => -1*Errno::EINVAL, # Dat: like EINVAL when creating a file named `?' on a vfat filesystem on Linux
   'bad tag query string' => -1*Errno::EINVAL,
+  'tag both to be added and removed' => -1*Errno::EINVAL,
   'bad UTF-8 string' => -1*Errno::EINVAL,
+  'bad setmode' => -1*Errno::EINVAL,
   'tag not found' => -1*Errno::ENOENT,
   'empty localname' => -1*Errno::EINVAL,
   'bad slashes in localname' => -1*Errno::EINVAL,

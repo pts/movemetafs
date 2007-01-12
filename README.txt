@@ -531,6 +531,11 @@ Special operations with files in meta/root:
 -- There is also the write-only attribute `user.mmfs.tags.tag' to add tags
    (in the value, separated by whitespace) and `user.mmfs.tags.untag' to
    remove tags.
+-- There is also the write-only attribute `user.mmfs.tags.modify', which
+   can remove all tags (with value `-:all') or add and remove some tags
+   (tags prefixed by `-' will be removed, tags prefixed by `+' or nothing
+   will be added). It accepts a whitespace-separated, possibly prefixed list
+   of tags.
 
 Some of the operations above are markes with `Safe only in meta filesystem.'
 This means that these operations should not be performed on the carrier
@@ -1192,7 +1197,6 @@ Improvement possibilites
 !! measure: file transfer speed (once it is opened) Imp: symlink to real
    file?
 !! measure: database size
-!! feature: load a lot of data
 !! feature: integrate recreate.sql to mmfs_fuse.pl
 !! SET SESSION group_concat_max_len = 2000000000;
    SUXX: SELECT @@ft_max_word_len; -- ERROR 1193 (HY000): Unknown system variable 'ft_max_word_len'
@@ -1263,8 +1267,21 @@ Improvement possibilites
         renames. Thus meta/adm/fixprincipal cannot work
 !! fix: still sometimes `fs' is inserted where it shouldn't
 !! feature: mmfs_rfsdelata_watcher.pl renames across filesystems
-!! fix: untag shouldn't create `fss'
 !! try: keep the hard link cache in the database
 !! feature: shell script user interface: _tag _showtag _fixprincipal
+!! feature: tag aliases
+!! feature: attaching description and tags to tags
+!! doc: qiv-command
+!! doc: ls | qiv --file /dev/stdin
+!! doc: qiv SUXX: <PageUp> goes by 5
+!! doc: qiv SUXX: cannot easily undo a `d'
+!! doc: GQview is better than qiv (except for color equalization)
+!! feature: ~/.movemetafs-client with root.prefix and mount.point for
+   GQview (and mc and others). Its syntax is very strict.
+!! try: do our timestamp (NOT NULL DEFAULT NOW()) columns change on row
+   modification? They shouldn't!
+!! test: is ts always GMT (seems to be, that's good)
+!! verify: syntax of recreate.sql
+
 
 __END__
