@@ -1209,5 +1209,7 @@ Improvement possibilites
 !! test: are prepred statements processen on the client side or in the
    MySQL server?
 !! feature: remove stale `meta/search/*' symlinks with `meta/adm/fixunlink'
+!! doc: cannot disable unlink of principal if $nlink>1 in
+   mmfs_rfsdelta_watcher.pl
 
 __END__
