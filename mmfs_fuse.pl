@@ -109,7 +109,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.21 2007-01-12 02:32:31 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.22 2007-01-12 03:00:18 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -652,12 +652,13 @@ sub mydb_delete_from_files_if_no_info_and_tags($$) {
 #** Dat: also changes files.principal.
 #** Dat: if $oldfn eq $fn, this is equivalent to moving the file to
 #**      `meta/adm/fixprincipal'.
-sub mydb_rename_fn($$) {
-  my($oldfn,$fn)=@_;
-  print STDERR "DB_RENAME_FN oldfn=($fn) fn=($fn)\n" if $config{'verbose.level'};
+sub mydb_rename_fn_to($) {
+  my($fn)=@_;
+  print STDERR "DB_RENAME_FN to fn=($fn)\n" if $config{'verbose.level'};
 
-  my $oldlocalname=$oldfn;
-  die "not a mirrored filename\n" if $oldlocalname!~s@\A/root/+@@;
+  # vvv Dat: can be anything, only the new name matters
+  #my $oldlocalname=$oldfn;
+  #die "not a mirrored filename\n" if $oldlocalname!~s@\A/root/+@@;
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@;
 
@@ -667,6 +668,9 @@ sub mydb_rename_fn($$) {
     my($fs,$ino,$dir_p)=eval { mydb_file_localname_to_fs_ino($localname,1,1) }; # Dat: this might die()
     #print STDERR "BBB($@)\n";
     return if $@; # Dat: maybe 'localname not a file' -- must exist, we've just renamed (!! Imp: avoid race condition)
+    #print STDERR "CCC\n";
+    my $L;
+    my $oldprincipal_calc;
     if (!defined $fs) {
       # Dat: we don't know anything about the target filesystem yet, but the
       #      rename(2) has already succeeded. This means `files' cannot contain
@@ -677,13 +681,18 @@ sub mydb_rename_fn($$) {
       #  mydb_rename_fn_low($oldshortprincipal, $shortprincipal, $localname, $ino, $fs);
       #});
       print STDERR "DB_RENAME_FN unknown fs localname=($localname)\n" if $config{'verbose.level'};
-    } elsif (!@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+      $dir_p=0;
+    } elsif (!@{$L=db_query_all("SELECT principal FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
       if (@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
         print STDERR "DB_RENAME_FN reinsert tagged\n" if $config{'verbose.level'};
         mydb_ensure_fs_ino_name($fs,$ino,$localname);
       }
-    } else {  
-      my $oldshortprincipal=$oldlocalname;
+      # Dat: now we need an $oldfn -> $oldprincipal_calc for proper renames
+      #      renames. Thus meta/adm/fixprincipal cannot work
+      $dir_p=0;
+    } else {
+      $oldprincipal_calc=$L->[0][0];
+      my $oldshortprincipal=$oldprincipal_calc;
       $oldshortprincipal=~s@\A.*/@@s;
       shorten_with_ext_bang($oldshortprincipal);
 
@@ -692,15 +701,15 @@ sub mydb_rename_fn($$) {
       shorten_with_ext_bang($shortprincipal);
       mydb_rename_fn_low(  $oldshortprincipal, $shortprincipal, $localname, $ino, $fs)
     }
-    if ($dir_p and $oldlocalname ne $localname) {
-      my $principal_likeq=$oldlocalname;
+    if ($dir_p or $oldprincipal_calc ne $localname) {
+      my $principal_likeq=$oldprincipal_calc;
       $principal_likeq=~s@([\%_\\])@\\$1@g; # Imp: mysql_likeq()
       # vvv Dat: no proper escape for sprintf() debug message below
       #print STDERR sprintf("DB_RENAME_FN UPDATE files SET principal=CONCAT('%s',SUBSTRING(BINARY principal FROM %d)) WHERE principal LIKE '%s'\n",
-      #  $localname, 1+length($oldlocalname), "$principal_likeq/%");
+      #  $localname, 1+length($oldprincipal_calc), "$principal_likeq/%");
       # vvv Dat: BINARY doesn't seem to ruin our character encoding
       my $rv=db_do("UPDATE files SET principal=CONCAT(?,SUBSTRING(BINARY principal FROM ?)) WHERE principal LIKE ?",
-        $localname, 1+length($oldlocalname), "$principal_likeq/%");
+        $localname, 1+length($oldprincipal_calc), "$principal_likeq/%");
       print STDERR "DB_RENAME_FN subdir contents rv=$rv\n" if $config{'verbose.level'};
     }
   },1);
@@ -718,13 +727,11 @@ sub mydb_rename_fn_low($$$$$) {
       $principal, $ino, $fs); # Dat: might have no effect
     print STDERR "DB_RENAME_FN QUICK TO principal=($principal) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
   } else {
-    db_transaction(sub {
-      print STDERR "DB_RENAME_FN TO principal=($principal) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-      ($shortprincipal1,$shortname1)=mydb_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
-      $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
-        $principal, $shortprincipal1, $shortname1, $ino, $fs); # Dat: might have no effect
-      print STDERR "DB_RENAME_FN TO principal=($principal) shortprincipal=($shortprincipal1) shortname=($shortname1) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
-    },1);
+    print STDERR "DB_RENAME_FN TO principal=($principal) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+    ($shortprincipal1,$shortname1)=mydb_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
+    $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
+      $principal, $shortprincipal1, $shortname1, $ino, $fs); # Dat: might have no effect
+    print STDERR "DB_RENAME_FN TO principal=($principal) shortprincipal=($shortprincipal1) shortname=($shortname1) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
   }
   # vvv Dat: caller makes sure
   #if ($rv==0 and @{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
@@ -1037,6 +1044,7 @@ sub mydb_file_set_tagtxt($$$) {
         verify_tag($tag)
       }
       # vvv Imp: together in a transaction
+      # vvv Dat: run 'tag' first to avoid early DB_DELETE on 'untag'
       mydb_file_set_tags_low($fn,$localname,\@tags_to_tag,'tag');
       mydb_file_set_tags_low($fn,$localname,\@tags_to_untag,'untag');
     } else { mydb_op_untag($fn,':all') }
@@ -1080,7 +1088,8 @@ sub mydb_file_set_tags_low($$$$) {
               $ino, $fs, $tag);
             #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
           }
-          mydb_delete_from_files_if_no_info($fs,$ino);
+          # vvv Dat: `_and_tags' is very important
+          mydb_delete_from_files_if_no_info_and_tags($fs,$ino);
         } else {
           db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) if
             $setmode eq 'set';
@@ -1751,7 +1760,7 @@ sub my_rename($$) {
     } elsif ($fn=~m@/adm/fixprincipal/[^/]+\Z(?!\n)@ &&
              defined($oldreal=sub_to_real($oldfn))) {
       # Dat: we ignore the target name inside /adm/fixprincipal
-      eval { mydb_rename_fn($oldfn,$oldfn) };
+      eval { mydb_rename_fn_to($oldfn) };
       return diemsg_to_nerrno()
     } elsif ($fn=~m@/adm/fixunlink/[^/]+\Z(?!\n)@ &&
              defined($oldreal=sub_to_real($oldfn))) {
@@ -1791,7 +1800,7 @@ sub my_rename($$) {
   } elsif (!rename($oldreal,$real)) {
     return -1*$!
   } else {
-    eval { mydb_rename_fn($oldfn,$fn) };
+    eval { mydb_rename_fn_to($fn) };
     return diemsg_to_nerrno()
   }
   return -1*Errno::EPERM

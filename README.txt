@@ -1222,5 +1222,7 @@ Improvement possibilites
    creates a hard link and then unlinks the principal
    Imp: store 1 hard link in an extra table?, also has to modify
      mmfs_rfsdelta_watcher.pl to add link() or $st_link>1 unlink() support
+!! fix: Dat: now we need an $oldfn -> $oldprincipal_calc for proper renames
+        renames. Thus meta/adm/fixprincipal cannot work
 
 __END__
