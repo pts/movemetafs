@@ -109,7 +109,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.20 2007-01-12 02:06:25 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.21 2007-01-12 02:32:31 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -581,10 +581,11 @@ sub mydb_file_localname_to_fs_ino($;$$) {
   die "localname not found\n" unless
     ($dev,$ino)=lstat($config{'root.prefix'}.$localname);
   die "localname not a file\n" if !$allow_nonfile_p and !-f _;
+  my $dir_p=(-d _);
   my $fs=$dev_to_fs{$dev};
   $fs=mydb_insert_fs($dev) if !defined$fs and !$allow_unknown_fs_p;
   #die "GOT fs=($fs)\n";
-  ($fs,$ino)
+  ($fs,$ino,$dir_p)
 }
 
 #** Dat: change this to have multiple filesystem support
@@ -660,63 +661,79 @@ sub mydb_rename_fn($$) {
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@;
 
-  my($fs,$ino)=eval { mydb_file_localname_to_fs_ino($localname,0,1) }; # Dat: this might die()
-  return if $@; # Dat: maybe 'localname not a file' -- must exist, we've just renamed (!! Imp: avoid race condition)
-  if (!defined $fs) {
-    # Dat: we don't know anything about the target filesystem yet, but the
-    #      rename(2) has already succeeded. This means `files' cannot contain
-    #      $localname, so it doesn't have to be changed, so we don't have to
-    #      do anything.
-    #db_transaction(sub {
-    #  ($fs,$ino)=mydb_file_localname_to_fs_ino($localname);
-    #  mydb_rename_fn_low($oldshortprincipal, $shortprincipal, $localname, $ino, $fs);
-    #});
-    print STDERR "DB_RENAME_FN unknown fs localname=($localname)\n" if $config{'verbose.level'};
-  } elsif (!@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
-    if (@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
-      print STDERR "DB_RENAME_FN reinsert tagged\n" if $config{'verbose.level'};
-      mydb_ensure_fs_ino_name($fs,$ino,$localname);
-    }
-  } else {  
-    my $oldshortprincipal=$oldlocalname;
-    $oldshortprincipal=~s@\A.*/@@s;
-    shorten_with_ext_bang($oldshortprincipal);
+  db_transaction(sub {
+    #print STDERR "AAA\n";
+    # vvv Dat: $allow_nonfile_p, because it might be a folder
+    my($fs,$ino,$dir_p)=eval { mydb_file_localname_to_fs_ino($localname,1,1) }; # Dat: this might die()
+    #print STDERR "BBB($@)\n";
+    return if $@; # Dat: maybe 'localname not a file' -- must exist, we've just renamed (!! Imp: avoid race condition)
+    if (!defined $fs) {
+      # Dat: we don't know anything about the target filesystem yet, but the
+      #      rename(2) has already succeeded. This means `files' cannot contain
+      #      $localname, so it doesn't have to be changed, so we don't have to
+      #      do anything.
+      #db_transaction(sub {
+      #  ($fs,$ino)=mydb_file_localname_to_fs_ino($localname);
+      #  mydb_rename_fn_low($oldshortprincipal, $shortprincipal, $localname, $ino, $fs);
+      #});
+      print STDERR "DB_RENAME_FN unknown fs localname=($localname)\n" if $config{'verbose.level'};
+    } elsif (!@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+      if (@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
+        print STDERR "DB_RENAME_FN reinsert tagged\n" if $config{'verbose.level'};
+        mydb_ensure_fs_ino_name($fs,$ino,$localname);
+      }
+    } else {  
+      my $oldshortprincipal=$oldlocalname;
+      $oldshortprincipal=~s@\A.*/@@s;
+      shorten_with_ext_bang($oldshortprincipal);
 
-    my $shortprincipal=$localname;
-    $shortprincipal=~s@\A.*/@@s;
-    shorten_with_ext_bang($shortprincipal);
-    mydb_rename_fn_low(  $oldshortprincipal, $shortprincipal, $localname, $ino, $fs)
-  }
+      my $shortprincipal=$localname;
+      $shortprincipal=~s@\A.*/@@s;
+      shorten_with_ext_bang($shortprincipal);
+      mydb_rename_fn_low(  $oldshortprincipal, $shortprincipal, $localname, $ino, $fs)
+    }
+    if ($dir_p and $oldlocalname ne $localname) {
+      my $principal_likeq=$oldlocalname;
+      $principal_likeq=~s@([\%_\\])@\\$1@g; # Imp: mysql_likeq()
+      # vvv Dat: no proper escape for sprintf() debug message below
+      #print STDERR sprintf("DB_RENAME_FN UPDATE files SET principal=CONCAT('%s',SUBSTRING(BINARY principal FROM %d)) WHERE principal LIKE '%s'\n",
+      #  $localname, 1+length($oldlocalname), "$principal_likeq/%");
+      # vvv Dat: BINARY doesn't seem to ruin our character encoding
+      my $rv=db_do("UPDATE files SET principal=CONCAT(?,SUBSTRING(BINARY principal FROM ?)) WHERE principal LIKE ?",
+        $localname, 1+length($oldlocalname), "$principal_likeq/%");
+      print STDERR "DB_RENAME_FN subdir contents rv=$rv\n" if $config{'verbose.level'};
+    }
+  },1);
 }
 
 #** Callable even if ($ino,$fs) is not known in the metadata store.
 #** Must be called in a transaction.
 sub mydb_rename_fn_low($$$$$) {
-  my($oldshortprincipal, $shortprincipal, $localname, $ino, $fs)=@_;
+  my($oldshortprincipal, $shortprincipal, $principal, $ino, $fs)=@_;
   my($shortprincipal1,$shortname1);
   my $rv;
   if ($oldshortprincipal eq $shortprincipal) { # Dat: shortcut: last filename component doesn't change
-    print STDERR "DB_RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+    print STDERR "DB_RENAME_FN QUICK TO principal=($principal) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
-      $localname, $ino, $fs); # Dat: might have no effect
-    print STDERR "DB_RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
+      $principal, $ino, $fs); # Dat: might have no effect
+    print STDERR "DB_RENAME_FN QUICK TO principal=($principal) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
   } else {
     db_transaction(sub {
-      print STDERR "DB_RENAME_FN TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-      ($shortprincipal1,$shortname1)=mydb_gen_shorts($localname,$fs,$ino); # Dat: this modifies the db and it might die()
+      print STDERR "DB_RENAME_FN TO principal=($principal) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+      ($shortprincipal1,$shortname1)=mydb_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
       $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
-        $localname, $shortprincipal1, $shortname1, $ino, $fs); # Dat: might have no effect
-      print STDERR "DB_RENAME_FN TO principal=($localname) shortprincipal=($shortprincipal1) shortname=($shortname1) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
+        $principal, $shortprincipal1, $shortname1, $ino, $fs); # Dat: might have no effect
+      print STDERR "DB_RENAME_FN TO principal=($principal) shortprincipal=($shortprincipal1) shortname=($shortname1) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
     },1);
   }
   # vvv Dat: caller makes sure
   #if ($rv==0 and @{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
   #  print STDERR "DB_RENAME_FN insert\n" if $config{'verbose.level'};
-  #  ($shortprincipal1,$shortname1)=mydb_gen_shorts($localname,$fs,$ino) if
+  #  ($shortprincipal1,$shortname1)=mydb_gen_shorts($principal,$fs,$ino) if
   #    !defined $shortprincipal1;
   #  # vvv Dat: similar to mydb_insert_fs_ino_principal()
   #  db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?,?)",
-  #    $localname, $shortname1, $shortprincipal1, $ino, $fs); # Dat: this shouldn't die()
+  #    $principal, $shortname1, $shortprincipal1, $ino, $fs); # Dat: this shouldn't die()
   #}
   $rv
 }
@@ -1150,7 +1167,7 @@ sub mydb_attr_dump($$) {
   #print $F "hello, world\n";
   db_do("SET SESSION group_concat_max_len = $db_big_31bit");
   my $prefixq=$prefix;
-  $prefixq=~s@([%_\\])@\\$1@g; # Dat: MySQL-specific quoting for LIKE # Imp: more metachars?
+  $prefixq=~s@([%_\\])@\\$1@g; # Imp: likeq() Dat: MySQL-specific quoting for LIKE # Imp: more metachars?
   my $sth=db_query("SELECT principal, descr,
     GROUP_CONCAT(tag ORDER BY tag SEPARATOR ' ')
     FROM files LEFT OUTER JOIN tags ON
