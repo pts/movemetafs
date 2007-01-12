@@ -41,6 +41,7 @@ sub rescan_mounts() {
   %dev_to_mprefix=();
   my $line;
   my $root_found_p=0;
+  local $/="\n";
   while (defined($line=<$F>)) {
     if ($line=~m@\A(/[^ ]*) ([^ ]+) @) {
       # Dat: $1 might be "/dev/root", but we don't care
@@ -56,6 +57,7 @@ sub rescan_mounts() {
     }
   }
   close($F);
+  # vvv Imp: how can we reach `no mpoints'
   die "error: no mpoints found in /proc/mounts\n" if !%dev_to_mprefix;
   die "error: dir / not found in /proc/mounts\n" if !$root_found_p;
   undef
@@ -131,6 +133,7 @@ while (<STDIN>) {
     print STDERR "warning: syntax error #2, ignoring event: $_\n"; next
   }
   if ($type eq 'a' and defined $ino) {
+    # !! track cross-device renames
     print STDERR "info: got move-target event: $_\n";
     if (!defined($mprefix=$dev_to_mprefix{$dev})) {
       print STDERR "warning: unknown dev: $dev\n";
@@ -146,6 +149,7 @@ while (<STDIN>) {
     # vvv Imp: possibly go by $ino (with symlink()?)
     my $from="$mmfs_mount_point/root".substr($mfn,length($mmfs_root_prefix));
     my $to="$mmfs_mount_point/adm/fixprincipal/:any";
+    # Dat: this works for folder renames
     print STDERR "info: issuing rename ($from) -> ($to)\n";
     print STDERR "warning: rename failed: $!\n" if !rename($from,$to);
   } elsif ($type eq 'u' and defined $ino and $nlink==1) {

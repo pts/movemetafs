@@ -109,7 +109,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.19 2007-01-12 01:09:48 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.20 2007-01-12 02:06:25 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -522,6 +522,7 @@ sub verify_localname($) {
 my %dev_to_fs;
 
 sub mydb_fill_dev_to_fs() {
+  print STDERR "DB_FILL_DEV_TO_FS\n" if $config{'verbose.level'};
   my $sth=db_query("SELECT dev, fs FROM fss");
   %dev_to_fs=();
   while (my($dev,$fs)=$sth->fetchrow_array()) {
@@ -671,10 +672,12 @@ sub mydb_rename_fn($$) {
     #  mydb_rename_fn_low($oldshortprincipal, $shortprincipal, $localname, $ino, $fs);
     #});
     print STDERR "DB_RENAME_FN unknown fs localname=($localname)\n" if $config{'verbose.level'};
-  } else {
-    # vvv Imp: don't go on if ($ino,$fs) is not known in the metadata store
-    return if !@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)};
-    
+  } elsif (!@{db_query_all("SELECT 1 FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+    if (@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
+      print STDERR "DB_RENAME_FN reinsert tagged\n" if $config{'verbose.level'};
+      mydb_ensure_fs_ino_name($fs,$ino,$localname);
+    }
+  } else {  
     my $oldshortprincipal=$oldlocalname;
     $oldshortprincipal=~s@\A.*/@@s;
     shorten_with_ext_bang($oldshortprincipal);
@@ -687,8 +690,10 @@ sub mydb_rename_fn($$) {
 }
 
 #** Callable even if ($ino,$fs) is not known in the metadata store.
+#** Must be called in a transaction.
 sub mydb_rename_fn_low($$$$$) {
   my($oldshortprincipal, $shortprincipal, $localname, $ino, $fs)=@_;
+  my($shortprincipal1,$shortname1);
   my $rv;
   if ($oldshortprincipal eq $shortprincipal) { # Dat: shortcut: last filename component doesn't change
     print STDERR "DB_RENAME_FN QUICK TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
@@ -698,12 +703,21 @@ sub mydb_rename_fn_low($$$$$) {
   } else {
     db_transaction(sub {
       print STDERR "DB_RENAME_FN TO principal=($localname) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-      my($shortprincipal1,$shortname1)=mydb_gen_shorts($localname,$fs,$ino); # Dat: this modifies the db and it might die()
+      ($shortprincipal1,$shortname1)=mydb_gen_shorts($localname,$fs,$ino); # Dat: this modifies the db and it might die()
       $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
         $localname, $shortprincipal1, $shortname1, $ino, $fs); # Dat: might have no effect
       print STDERR "DB_RENAME_FN TO principal=($localname) shortprincipal=($shortprincipal1) shortname=($shortname1) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
     },1);
   }
+  # vvv Dat: caller makes sure
+  #if ($rv==0 and @{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
+  #  print STDERR "DB_RENAME_FN insert\n" if $config{'verbose.level'};
+  #  ($shortprincipal1,$shortname1)=mydb_gen_shorts($localname,$fs,$ino) if
+  #    !defined $shortprincipal1;
+  #  # vvv Dat: similar to mydb_insert_fs_ino_principal()
+  #  db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?,?)",
+  #    $localname, $shortname1, $shortprincipal1, $ino, $fs); # Dat: this shouldn't die()
+  #}
   $rv
 }
 

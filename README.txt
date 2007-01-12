@@ -1211,5 +1211,16 @@ Improvement possibilites
 !! feature: remove stale `meta/search/*' symlinks with `meta/adm/fixunlink'
 !! doc: cannot disable unlink of principal if $nlink>1 in
    mmfs_rfsdelta_watcher.pl
+!! SUXX: qiv-delete: missing from `files', present in `tags'
+!! feature: find tagged files lost from `files' 
+   SELECT tags.ino,tags.fs,GROUP_CONCAT(tag SEPARATOR ' ') AS tags FROM tags
+     LEFT OUTER JOIN files ON files.ino=tags.ino AND files.fs=tags.fs
+     WHERE tags.fs<>'' AND files.ino IS NULL GROUP by tags.ino, tags.fs;
+!! SUXX: .qiv-trash with mmfs_rfsdelta_watcher.pl
+   info: got boring event: lFD00006,?:dm-6:/d/proba/.qiv-trash/pts.jpg
+   info: got boring event: uFD00006,5D5A2,81A4,2,0:dm-6:/d/proba/pts.jpg
+   creates a hard link and then unlinks the principal
+   Imp: store 1 hard link in an extra table?, also has to modify
+     mmfs_rfsdelta_watcher.pl to add link() or $st_link>1 unlink() support
 
 __END__
