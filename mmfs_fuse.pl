@@ -109,7 +109,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.18 2007-01-11 23:54:09 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.19 2007-01-12 01:09:48 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -592,7 +592,7 @@ sub mydb_file_st_to_fs_ino($$;$) {
   die if db_connect()->{'AutoCommit'}; # Dat: needs transaction
   my $fs=$dev_to_fs{$st_dev};
   if (!defined$fs) {
-    return (undef,undef) if !$allow_unknown_fs_p;
+    return (undef,undef) if $allow_unknown_fs_p;
     $fs=mydb_insert_fs($st_dev);
     die if !defined $fs;
   }
