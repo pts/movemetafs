@@ -27,6 +27,8 @@ movemetafs is similar to LAFS (http://junk.nocrew.org/~stefan/lafs/)
    out new features.
 -- movemetafs continues to work when files are renamed.
 -- movemetafs works with files with more than one hard link.
+-- movemetafs automatically forgets metadata when a last hard link of a file
+   is removed.
 
 Features of movemetafs:
 
@@ -277,7 +279,7 @@ Principal name: Files with multiple hard links share the same set of tags.
 Such a tagged file has a principal name (which is returned in symlinks in
 search results, and which was assigned the file was first tagged, or later,
 when it was last renamed). For safety (and operability) reasons, movemetafs
-gives the EPERM error when you attempt to remove (unlink) the principal name
+gives the `Device or resurce busy' (EBUSY) error when you attempt to remove (unlink) the principal name
 of a file with multiple hard links. To remove such a name A, locate another
 name B first (might involve a slow find(1) with `-inum ...' on the carrier),
 move B to `meta/adm/fixprincipal', then remove A. (Alternatively of moving
@@ -409,6 +411,10 @@ The most important configuration entries for movemetafs:
 -- root.prefix (default: '/'): the carrier filesystem folder, this will
    be visible as `meta/root'. Can be absolute or relative (to the current
    folder of the `mmfs_fuse.pl' program invocation).
+-- hard.link.cache.size (default: 16): maximum number of hard links in the
+   in-memory hard link cache. The hard link cache is for tracking principals
+   in rename operations which use `link(oldfn,fn); unlink(oldfn)' instead of
+   `rename(oldfn,fn)' (such as in qiv(1)).
 
 To find out more configuration entries, please read `mmfs_fuse.pl'
 (search for `%config_default' and `config_process_option').
@@ -686,6 +692,32 @@ Special folders are:
       on the carrier filesystem), or if it is desired to change the
       principal name of a tagged file with multiple hard links. Read more
       in ``Principal name''.
+   -- When a symlink `meta/adm/fixrename:<toq>' is attempted to be created
+      pointing to `<from>', it is eqivalent to moving <from> to <toq> in the
+      database. This can be used for notification after the actual rename()
+      has happened. Example:
+      symlink("/foo/bar","meta/adm/fixrename:other:sa:sfile") is equivalent
+      to rename("meta/root/foo/bar","meta/root/other/a/file"). Please note
+      that in <toq> slashes are must be escaped as `:s', and colons must be
+      escaped as `::'. Upon success, `No such file or directory' is
+      returned.
+   -- When a symlink `meta/adm/tolinkcache:<toq>' is attempted to be
+      created pointing to `<from>', the entry (principal=<from>, link=<toq>)
+      is added to the in-memory hard link cache. This can be used for
+      notification after the actual link() has happened. Example:
+      symlink("/foo/bar","meta/adm/fixrename:other:sa:sfile") is equivalent
+      to link("meta/root/foo/bar","meta/root/other/a/file"). Please note
+      that in <toq> slashes are must be escaped as `:s', and colons must be
+      escaped as `::'. Upon success, `No such file or directory' is
+      returned.
+   -- When a folder `meta/adm/fixunlink:<dev>,<ino>,<nlink>:<toq>' is
+      attempted to be created, the file named <toq> (but no other hard
+      links) having <dev>, <ino> and <nlink> is removed from the database.
+      This can be used for notification after the actual unlink() has
+      happened. Example: mkdir("meta/adm/fixunlink:other:sa:sfile") is
+      equivalent to link("meta/root/other/a/file"). Please note that in
+      <toq> slashes are must be escaped as `:s', and colons must be escaped
+      as `::'. Upon success, `No such file or directory' is returned.
    -- The folder `meta/adm/fixunlink' appears to be empty. If a file
       is moved here from `meta/root', all metadata movemetafs knows about
       the file and its hard links (including tags, description and principal)
@@ -695,7 +727,7 @@ Special folders are:
 
       Please note that this tool is a little dangerous since it
       removes metadata.
-   -- `meta/adm/fixunlinkino:<dev>,<ino>' (where <dev> is a hexadecimal
+   -- `meta/adm/fixunlinkino:<dev>,<ino>,<nlink>' (where <dev> is a hexadecimal
       st_dev number and <ino> is a hexadecimal st_ino number of the same
       file) is a missing directory. When attemted to be created, all
       metadata movemetafs knows about the file (speficied by <dev>,<ino>)
@@ -876,8 +908,10 @@ files, problems might arise when st_dev or st_ino change.
 
 st_dev changes
 
--- when (part of) the filesystem is moved to another partition,
+-- when (part of) the filesystem is moved to another partition;
 -- or the data is copied (migrated) to another filesystem or another machine;
+-- or the file s moved (using copy+delete) to another filesystem (==
+   partition);
 -- or the device is connected under a different name (e.g. the hard
    drive is recognized as /dev/sdb instead of /dev/sda);
 -- or the filesystem is rebuilt (e.g. the system is restored from a .tar.gz
@@ -885,8 +919,11 @@ st_dev changes
 
 st_ino changes
 
--- when the data is copied (migrated) to another filesystem or another
-   machine;
+-- when the file is copied (not moved) to another folder within the
+   filesystem (tracking this with FUSE is a yet unimplemented feature of
+   movemetafs);
+-- when the data is copied or moved (migrated) to another filesystem or
+   another machine;
 -- or the filesystem is rebuilt (e.g. the system is restored from a .tar.gz
    backup);
 -- or a file is moved in a `copy; delete' sequence.
@@ -1224,5 +1261,10 @@ Improvement possibilites
      mmfs_rfsdelta_watcher.pl to add link() or $st_link>1 unlink() support
 !! fix: Dat: now we need an $oldfn -> $oldprincipal_calc for proper renames
         renames. Thus meta/adm/fixprincipal cannot work
+!! fix: still sometimes `fs' is inserted where it shouldn't
+!! feature: mmfs_rfsdelata_watcher.pl renames across filesystems
+!! fix: untag shouldn't create `fss'
+!! try: keep the hard link cache in the database
+!! feature: shell script user interface: _tag _showtag _fixprincipal
 
 __END__

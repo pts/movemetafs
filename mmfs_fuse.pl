@@ -98,6 +98,7 @@ my %config_default=(
   #** $root_prefix specifies the real filesystem path to be seen in
   #** "$config{'mount.point'}/root"
   'root.prefix'=>'/',
+  'hard.link.cache.size'=>16,
 );
 
 #** Processes a command-line option
@@ -109,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.22 2007-01-12 03:00:18 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.23 2007-01-12 14:15:02 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -341,7 +342,63 @@ sub db_transaction($;$) {
   $ret
 }
 
-# -- movemetafs-specific database routines (mydb_*())
+# --- hard link cache routines
+
+#** `push @hard_link_cache_list, [$principal, $link]' means: $link is a hard
+#** link to principal $principal. Both have localname syntax;
+my @hard_link_cache_list;
+#** $hard_link_cache_hash{$principal}=$I means that $link for $principal
+#** can be found in $hard_link_cache_list[$I]
+my %hard_link_cache_hash;
+#** Insert position into @hard_link_cache_list;
+my $hard_link_cache_ipos=0;
+
+#** Also removes oldest entry in FIFO order to respect
+#** $config{'hard.link.cache.size'};
+sub hard_link_cache_set($$) {
+  my($principal,$link)=@_;
+  print STDERR "HARD_LINK_CACHE_SET principal=($principal) link=($link)\n" if $config{'verbose.level'};
+  if (exists $hard_link_cache_hash{$principal}) {
+    $hard_link_cache_list[$hard_link_cache_hash{$principal}][1]=$link
+  } else {
+    my $maxsize=$config{'hard.link.cache.size'};
+    if (@hard_link_cache_list>=$maxsize) {
+      delete @hard_link_cache_hash{map { $_->[0] }
+        splice @hard_link_cache_list, $maxsize } if
+        @hard_link_cache_list>$maxsize;
+      $hard_link_cache_ipos=0 if $hard_link_cache_ipos>=$maxsize;
+      delete $hard_link_cache_hash{
+        $hard_link_cache_list[$hard_link_cache_ipos][0] };
+    }
+    $hard_link_cache_hash{$principal}=$hard_link_cache_ipos;
+    $hard_link_cache_list[$hard_link_cache_ipos++]=[$principal,$link];
+  }
+  $link
+}
+
+#** @return $link or undef
+sub hard_link_cache_get($) {
+  my($principal)=@_;
+  my $pos=$hard_link_cache_hash{$principal};
+  defined $pos ? $hard_link_cache_list[$pos][1] : undef
+}
+
+#** @return $link or undef
+sub hard_link_cache_delete($) {
+  my($principal)=@_;
+  my $pos=$hard_link_cache_hash{$principal};
+  return undef if !defined $pos;
+  my $ret=$hard_link_cache_list[$pos][1];
+  delete $hard_link_cache_hash{$principal};
+  my $maxsize=$config{'hard.link.cache.size'};
+  if ($pos+1==($hard_link_cache_ipos or $maxsize)) {
+    $hard_link_cache_ipos=$pos;
+    # Imp: always delete from $hard_link_cache_list to save space
+  }
+  $ret
+}
+
+# --- movemetafs-specific database routines (mydb_*())
 
 sub verify_tag($) {
   my($tag)=@_;
@@ -652,13 +709,15 @@ sub mydb_delete_from_files_if_no_info_and_tags($$) {
 #** Dat: also changes files.principal.
 #** Dat: if $oldfn eq $fn, this is equivalent to moving the file to
 #**      `meta/adm/fixprincipal'.
-sub mydb_rename_fn_to($) {
-  my($fn)=@_;
+#** @param $oldfn is important only when $fn is a directory. If no info
+#**   about $oldfn, just set $oldfn=$fn.
+sub mydb_rename_fn($$) {
+  my($oldfn,$fn)=@_;
   print STDERR "DB_RENAME_FN to fn=($fn)\n" if $config{'verbose.level'};
 
   # vvv Dat: can be anything, only the new name matters
-  #my $oldlocalname=$oldfn;
-  #die "not a mirrored filename\n" if $oldlocalname!~s@\A/root/+@@;
+  my $oldlocalname=$oldfn;
+  die "not a mirrored filename\n" if $oldlocalname!~s@\A/root/+@@;
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@;
 
@@ -676,10 +735,6 @@ sub mydb_rename_fn_to($) {
       #      rename(2) has already succeeded. This means `files' cannot contain
       #      $localname, so it doesn't have to be changed, so we don't have to
       #      do anything.
-      #db_transaction(sub {
-      #  ($fs,$ino)=mydb_file_localname_to_fs_ino($localname);
-      #  mydb_rename_fn_low($oldshortprincipal, $shortprincipal, $localname, $ino, $fs);
-      #});
       print STDERR "DB_RENAME_FN unknown fs localname=($localname)\n" if $config{'verbose.level'};
       $dir_p=0;
     } elsif (!@{$L=db_query_all("SELECT principal FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
@@ -687,9 +742,8 @@ sub mydb_rename_fn_to($) {
         print STDERR "DB_RENAME_FN reinsert tagged\n" if $config{'verbose.level'};
         mydb_ensure_fs_ino_name($fs,$ino,$localname);
       }
-      # Dat: now we need an $oldfn -> $oldprincipal_calc for proper renames
-      #      renames. Thus meta/adm/fixprincipal cannot work
-      $dir_p=0;
+      # vvv Imp: avoid $dir_p in race condition with mmfs_rfsdelta_watcher.pl
+      $oldprincipal_calc=$oldlocalname if $dir_p;
     } else {
       $oldprincipal_calc=$L->[0][0];
       my $oldshortprincipal=$oldprincipal_calc;
@@ -701,7 +755,7 @@ sub mydb_rename_fn_to($) {
       shorten_with_ext_bang($shortprincipal);
       mydb_rename_fn_low(  $oldshortprincipal, $shortprincipal, $localname, $ino, $fs)
     }
-    if ($dir_p or $oldprincipal_calc ne $localname) {
+    if ($dir_p and defined $oldprincipal_calc and $oldprincipal_calc ne $localname) {
       my $principal_likeq=$oldprincipal_calc;
       $principal_likeq=~s@([\%_\\])@\\$1@g; # Imp: mysql_likeq()
       # vvv Dat: no proper escape for sprintf() debug message below
@@ -811,17 +865,21 @@ sub mydb_op_untag($$) {
     my $localname=mydb_fn_to_localname($fn);
     die "not pointing to a mirrored filename\n" if !defined$localname;
     print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag)\n" if $config{'verbose.level'};
-    my($fs,$ino)=mydb_file_localname_to_fs_ino($localname,1,0); # Dat: this might die()
-    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-    my $rv=($tag eq ':all') ?
-      db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
-      db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
-    print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $config{'verbose.level'};
-    if ($rv or $tag eq ':all') { # actiually removed a tag
-      mydb_delete_from_taggings_for($fs,$ino,$tag);
-      if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
-        mydb_delete_from_files_if_no_info($fs,$ino);
+    my($fs,$ino)=mydb_file_localname_to_fs_ino($localname,1,1); # Dat: this might die()
+    if (defined $fs) {
+      print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+      my $rv=($tag eq ':all') ?
+        db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
+        db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?", $ino, $fs, $tag);
+      print STDERR "DB_OP_UNTAG localname=($localname) tag=($tag) ino=$ino fs=($fs) rv=$rv\n" if $config{'verbose.level'};
+      if ($rv or $tag eq ':all') { # actiually removed a tag
+        mydb_delete_from_taggings_for($fs,$ino,$tag);
+        if (!@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+          mydb_delete_from_files_if_no_info($fs,$ino);
+        }
       }
+    } else {
+      print STDERR "DB_OP_UNTAG unknown fs\n";
     }
   },1);
 }
@@ -831,9 +889,9 @@ sub mydb_op_untag_shortname($$) {
   die if !defined $tag;
   print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag)\n" if $config{'verbose.level'};
   db_transaction(sub { # Imp: is it faster without a transaction?
-    my $R=db_query_all("SELECT fs, ino FROM files WHERE shortname=? LIMIT 1", $shortname);
-    if (@$R) {
-      my($fs,$ino)=@{$R->[0]};
+    my $L=db_query_all("SELECT fs, ino FROM files WHERE shortname=? LIMIT 1", $shortname);
+    if (@$L) {
+      my($fs,$ino)=@{$L->[0]};
       print STDERR "DB_OP_UNTAG_SHORTNAME shortname=($shortname) tag=($tag) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
       my $rv=($tag eq ':all') ?
         db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) :
@@ -1057,52 +1115,57 @@ sub mydb_file_set_tagtxt($$$) {
 
 sub mydb_file_set_tags_low($$$$) {
   my($fn,$localname,$tags,$setmode)=@_;
-  return if !@$tags and $setmode ne 'set';
+  if (@$tags) {}
+  elsif ($setmode eq 'set') { $tags=[':all']; $setmode='untag' }
+  else { return }
+  return mydb_op_untag($fn,':all') if $setmode eq 'untag' and
+    grep { $_ eq ':all' } @$tags;
+  # Dat: now @$tags is not empty
   db_transaction(sub {
     print STDERR "DB_FILE_SET_TAGTXT_LOW localname=($localname) tags=(@$tags) setmode=($setmode)\n" if $config{'verbose.level'};
     # vvv Dat: similar to mydb_file_get_tags()
-    my($fs,$ino)=mydb_file_localname_to_fs_ino($localname); # Dat: this might die()
-    # vvv Dat: works even if `fs--ino' is missing from `files'
-    my @old_tags=map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
-      $ino, $fs)};
-    if ($setmode ne 'set' or join(' ', sort@$tags) ne join(' ', sort@old_tags)) {
+    my($fs,$ino)=($setmode eq 'untag' ?
+      mydb_file_localname_to_fs_ino($localname,1,1) :
+      mydb_file_localname_to_fs_ino($localname)); # Dat: this might die()
+    my @old_tags=(defined$fs ? map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
+      $ino, $fs)} : ());
+    if (!defined $fs) {
+      print STDERR "DB_FILE_SET_TAGTXT_LOW localname=($localname) unknown fs\n";
+    } elsif ($setmode ne 'set' or join(' ', sort@$tags) ne join(' ', sort@old_tags)) {
+      # Dat: works even if `fs--ino' is missing from `files'
       # Imp: DELETE and INSERT only the difference
-      if (@$tags) {
-        # Dat: no problem if duplicates in @$tags
-        # Imp: optimize, remove duplicates
-        { my %all_tags;
-          # vvv Imp: don't cache statement, and use subset of @$tags
-          for my $row (@{db_query_all("SELECT tag FROM tags WHERE ino=0 AND fs=''")}) {
-            $all_tags{$row->[0]}=1
-          }
-          for my $tag (@$tags) { die "unknown tag: $tag\n" if !defined $all_tags{$tag} }
+      # Dat: no problem if duplicates in @$tags
+      # Imp: optimize, remove duplicates
+      { my %all_tags;
+        # vvv Imp: don't cache statement, and use subset of @$tags
+        for my $row (@{db_query_all("SELECT tag FROM tags WHERE ino=0 AND fs=''")}) {
+          $all_tags{$row->[0]}=1
         }
-        # Imp: implement file_shortname_to_fs_ino() in addition to
-        #      mydb_file_localname_to_fs_ino() to avoid extra database access
-        print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@$tags) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-        mydb_ensure_fs_ino_name($fs,$ino,$localname);
-        ## vvv Dat: different when row already present
-        if ($setmode eq 'untag') {
-          for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
-            db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?",
-              $ino, $fs, $tag);
-            #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
-          }
-          # vvv Dat: `_and_tags' is very important
-          mydb_delete_from_files_if_no_info_and_tags($fs,$ino);
-        } else {
-          db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) if
-            $setmode eq 'set';
-          for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
-            db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
-              $ino, $fs, $tag);
-            #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
-          }
-        }
-        mydb_update_taggings_for($fs,$ino); # Dat: a if $had_change_p;
-      } else {
-        mydb_op_untag($fn,':all') if $setmode eq 'set';
+        for my $tag (@$tags) { die "unknown tag: $tag\n" if !defined $all_tags{$tag} }
       }
+      # Imp: implement file_shortname_to_fs_ino() in addition to
+      #      mydb_file_localname_to_fs_ino() to avoid extra database access
+      print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@$tags) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
+      mydb_ensure_fs_ino_name($fs,$ino,$localname);
+      ## vvv Dat: different when row already present
+      if ($setmode eq 'untag') {
+        for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
+          db_do("DELETE FROM tags WHERE ino=? AND fs=? AND tag=?",
+            $ino, $fs, $tag);
+          #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
+        }
+        # vvv Dat: `_and_tags' is very important
+        mydb_delete_from_files_if_no_info_and_tags($fs,$ino);
+      } else {
+        db_do("DELETE FROM tags WHERE ino=? AND fs=?", $ino, $fs) if
+          $setmode eq 'set';
+        for my $tag (@$tags) { # Imp: faster (cannot do w/o multiple INSERTs :-(
+          db_do("INSERT INTO tags (ino, fs, tag) VALUES (?,?,?) ON DUPLICATE KEY UPDATE tag=tag",
+            $ino, $fs, $tag);
+          #$had_change_p=1 if $rv==1; # Dat: $rv==2: updated, $rv==1: inserted
+        }
+      }
+      mydb_update_taggings_for($fs,$ino); # Dat: a if $had_change_p;
     } else {
       print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tags=(@$tags) unchanged\n" if $config{'verbose.level'};
     }
@@ -1257,6 +1320,14 @@ sub mydb_purgeallmeta() {
   print STDERR "DB_PURGEALLMETA finished.\n" if $config{'verbose.level'};
 }
 
+sub file_stat_localname_is($$$) {
+  my($localname,$exp_dev,$exp_ino)=@_;
+  my($st_dev,$st_ino)=lstat($config{'root.prefix'}.$localname);
+  return undef if !defined $st_ino;
+  ($st_dev!=$exp_dev or $st_ino!=$exp_ino) ? 0 : 1
+}
+
+
 #die $dbh->{AutoCommit};
 #db_connect()->begin_work();
 ##die $dbh->{AutoCommit} ? 1 : 0;
@@ -1339,6 +1410,16 @@ sub sub_to_real($) {
   return (substr($fn,0,length($mpoint)) eq $mpoint and
     (length($fn)==length($mpoint) or substr($fn,length($mpoint),1)eq"/") ) ?
     undef : $fn
+}
+
+#** @return undef on syntax error
+#** @example colonfn_to_fn(
+sub colonfn_to_fn($) {
+  my($fn)=@_; $fn=~s@:(.)@ $1 eq 's' ? '/' : $1 @ges;
+  return undef if substr($fn,0,1) eq '/' or
+    substr($fn,-1) eq '/' or 0<=index($fn,'//');
+  substr($fn,0,0)="/root/";
+  $fn
 }
 
 # Dat: Linux-specific
@@ -1572,8 +1653,9 @@ sub my_write($$$) {
 
 sub my_unlink($) {
   my($fn)=@_;
-  my $real;
   print STDERR "UNLINK($fn)\n" if $config{'verbose.level'};
+  my $real;
+  my($localname,$linklocalname);
   if (!defined($real=sub_to_real($fn))) {
     if ($fn=~m@/(?:tagged)/([^/]+)/([^/]+)\Z(?!\n)@) {
       my $tag=$1; my $shortname=$2;
@@ -1585,12 +1667,22 @@ sub my_unlink($) {
     my($st_dev,$st_ino,$st_mode,$st_nlink)=lstat($real);
     if (defined $st_nlink and $st_nlink>1) {
       # ^^^ Dat: this check has a race condition only
-      my $may_p=eval { mydb_may_unlink_multi($fn) };
-      return diemsg_to_nerrno() if $@;
-      return -1*Errno::EPERM if !$may_p;
+      $localname=$fn; $localname=~s@\A/root/@@;
+      $linklocalname=hard_link_cache_get($localname);
+      if (!defined $linklocalname or !file_stat_localname_is($linklocalname,$st_dev,$st_ino)) {
+        hard_link_cache_delete($localname) if defined $localname;
+        undef $linklocalname;
+        my $may_p=eval { mydb_may_unlink_multi($fn) };
+        return diemsg_to_nerrno() if $@;
+        return -1*Errno::EBUSY if !$may_p;
+      }
     }
     return -1*$! if !unlink($real);
-    if (defined $st_nlink and $st_nlink==1) {
+    if (defined $linklocalname) {
+      eval { mydb_rename_fn($fn,"/root/".$linklocalname) };
+      return diemsg_to_nerrno() if $@;
+      hard_link_cache_delete($localname);
+    } elsif (defined $st_nlink and $st_nlink==1) {
       # Dat: when the last (hard) link of a file is removed, remove the file
       #      from the metadata store
       eval { mydb_unlink_last($fn,$st_dev,$st_ino) };
@@ -1654,8 +1746,20 @@ sub my_mkdir($$) {
       return diemsg_to_nerrno();
       # ^^^ Dat: although we return 0 here, FUSE will GETATTR() after MKDIR(),
       #          and return Errno::ENOENT to the application.
-    } elsif ($fn=~m@/adm/fixunlinkino:([0-9a-fA-F]+),([0-9a-fA-F]+),([0-9a-fA-F]+)\Z(?!\n)@) {
-      return myhelper_fixunlinkino($1,$2,$3);
+    } elsif ($fn=~m@\A/adm/fixunlinkino:([0-9a-fA-F]+),([0-9a-fA-F]+),([0-9a-fA-F]+)\Z(?!\n)@) {
+      return myhelper_fixunlinkino(hex($1),hex($2),hex($3));
+    } elsif ($fn=~m@\A/adm/fixunlink:([0-9a-fA-F]+),([0-9a-fA-F]+),([0-9a-fA-F]+):(.*)@s) {
+      my($st_dev,$st_ino,$st_nlink)=(hex($1),hex($2),hex($3));
+      my $fn=colonfn_to_fn($4);
+      print STDERR "FIXUNLINK st_dev=$st_dev st_ino=$st_ino st_nlink=$st_nlink fn=($fn)\n" if $config{'verbose.level'};
+      my $ret=myhelper_fixunlink($st_dev,$st_ino,$st_nlink,$fn);
+      if ($ret and $config{'verbose.level'}) {
+        # Imp: why do we get Errno::EBUSY?
+        $!=-$ret;
+        print STDERR "FIXUNLINK unlink post-failed: $!\n"
+      }
+      return $ret ? $ret : -1*Errno::ENOENT; # Dat: superfluous but saves time
+      # Imp: log EBUSY etc.
     }
     return -1*Errno::EPERM
   } elsif (!mkdir($real,$mode)) {
@@ -1663,6 +1767,39 @@ sub my_mkdir($$) {
   } else {
     return 0
   }
+}
+
+sub myhelper_fixunlink($$$$) {
+  my($st_dev,$st_ino,$st_nlink,$fn)=@_;
+  my($localname,$linklocalname);
+  if (defined $st_nlink and $st_nlink>1) {
+    # ^^^ Dat: this check has a race condition only
+    $localname=$fn; $localname=~s@\A/root/@@;
+    $linklocalname=hard_link_cache_get($localname);
+    if (!defined $linklocalname or !file_stat_localname_is($linklocalname,$st_dev,$st_ino)) {
+      hard_link_cache_delete($localname) if defined $localname;
+      undef $linklocalname;
+      my $may_p=eval { mydb_may_unlink_multi($fn) };
+      return diemsg_to_nerrno() if $@;
+      return -1*Errno::EBUSY if !$may_p;
+    }
+    print STDERR "FIXUNLINK found link localname=($linklocalname)\n" if
+      defined $linklocalname and $config{'verbose.level'};
+  }
+  #return -1*$! if !unlink($real); # Dat: already done
+  if (defined $linklocalname) {
+    eval { mydb_rename_fn($fn,"/root/".$linklocalname) };
+    return diemsg_to_nerrno() if $@;
+    hard_link_cache_delete($localname);
+  } elsif (defined $st_nlink and $st_nlink==1) {
+    # Dat: when the last (hard) link of a file is removed, remove the file
+    #      from the metadata store
+    eval { mydb_unlink_last($fn,$st_dev,$st_ino) };
+    # vvv Dat: always succeed if remove succeeds
+    #return diemsg_to_nerrno()
+    print STDERR "info: unlink error: $@" if $@;
+  }
+  return 0;
 }
 
 sub my_chmod($$) {
@@ -1709,6 +1846,26 @@ sub my_symlink($$) {
   my $real;
   print STDERR "SYMLINK($target,$fn)\n" if $config{'verbose.level'};
   if (!defined($real=sub_to_real($fn))) {
+    if ($fn=~m@\A/adm/(fixrename|tolinkcache):(.*)@s) {
+      my $action=$1;
+      my $fn=colonfn_to_fn($2);
+      return -1*Errno::EINVAL if !defined $fn;
+      my $oldfn=$target;
+      return -1*Errno::EINVAL if substr($oldfn,0,1) ne '/' or
+        substr($oldfn,-1) eq '/' or 0<=index($oldfn,'//');
+      substr($oldfn,0,0)="/root";
+      if ($action eq 'fixrename') {
+        print STDERR "FIXRENAME oldfn=($oldfn) fn=($fn)\n" if $config{'verbose.level'};
+        eval { mydb_rename_fn($oldfn,$fn); };
+        return diemsg_to_nerrno()
+      } else {
+        if ($oldfn=~s@\A/root/+@@ and $fn=~s@\A/root/+@@) {
+          # DatL hard_link_cache_set() reports: print STDERR "ADD TO LINK CACHE oldfn=($oldfn) fn=($fn)\n" if $config{'verbose.level'};
+          hard_link_cache_set($oldfn,$fn);
+        }
+      }
+      return -1*Errno::ENOENT; # Dat: superfluous but saves time
+    }
     return -1*Errno::EPERM
   } elsif (!symlink($target,$real)) {
     return -1*$!
@@ -1728,14 +1885,17 @@ sub my_link($$) {
   } elsif (!link($oldreal,$real)) {
     return -1*$!
   } else {
+    if ($oldfn=~s@\A/root/+@@ and $fn=~s@\A/root/+@@) {
+      # Dat: save $oldfn in case unlink($fn) is soon to follow
+      # vvv Imp: maybe verify whether $fn is a principal etc.
+      hard_link_cache_set($oldfn,$fn);
+    }
     return 0
   }
 }
 
-sub myhelper_fixunlinkino($$$) { # !!
-  my($st_dev_hex,$st_ino_hex,$st_nlink_hex)=@_;
-  my $st_dev=hex($st_dev_hex); my $st_ino=hex($st_ino_hex);
-  my $st_nlink=hex($st_nlink_hex);
+sub myhelper_fixunlinkino($$$) {
+  my($st_dev,$st_ino,$st_nlink)=@_;
   if ($st_nlink==1) { # Dat: this is to force the caller think to $st_nlink
     # Dat: we ignore the target name inside /adm/fixprincipal
     eval { mydb_unlink_last(sprintf("inode/%X,%X",$st_dev,$st_ino),
@@ -1760,7 +1920,7 @@ sub my_rename($$) {
     } elsif ($fn=~m@/adm/fixprincipal/[^/]+\Z(?!\n)@ &&
              defined($oldreal=sub_to_real($oldfn))) {
       # Dat: we ignore the target name inside /adm/fixprincipal
-      eval { mydb_rename_fn_to($oldfn) };
+      eval { mydb_rename_fn($oldfn,$oldfn) };
       return diemsg_to_nerrno()
     } elsif ($fn=~m@/adm/fixunlink/[^/]+\Z(?!\n)@ &&
              defined($oldreal=sub_to_real($oldfn))) {
@@ -1800,7 +1960,7 @@ sub my_rename($$) {
   } elsif (!rename($oldreal,$real)) {
     return -1*$!
   } else {
-    eval { mydb_rename_fn_to($fn) };
+    eval { mydb_rename_fn($oldfn,$fn) };
     return diemsg_to_nerrno()
   }
   return -1*Errno::EPERM
