@@ -1282,6 +1282,8 @@ Improvement possibilites
    modification? They shouldn't!
 !! test: is ts always GMT (seems to be, that's good)
 !! verify: syntax of recreate.sql
+!! feature: search for tags only in this dir
+!! feature: remove unknown tags without errors
 
 
 __END__

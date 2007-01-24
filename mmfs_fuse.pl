@@ -59,7 +59,7 @@ use DBI;
 #use DBD::mysql; # Dat: automatic for DBI->connect
 
 use vars qw($VERSION); # Dat: see also CVS ID 
-BEGIN { $VERSION='0.05' }
+BEGIN { $VERSION='0.06' }
 
 # --- Configuration functions
 
@@ -110,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.24 2007-01-12 21:07:07 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.25 2007-01-24 11:52:31 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
