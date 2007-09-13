@@ -59,7 +59,7 @@ use DBI;
 #use DBD::mysql; # Dat: automatic for DBI->connect
 
 use vars qw($VERSION); # Dat: see also CVS ID 
-BEGIN { $VERSION='0.06' }
+BEGIN { $VERSION='0.07' }
 
 # --- Configuration functions
 
@@ -110,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.25 2007-01-24 11:52:31 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.26 2007-09-13 08:02:49 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -2073,6 +2073,7 @@ sub my_listxattr($) {
   my $real;
   my @attrs;
   print STDERR "LISTXATTR($fn)\n" if $config{'verbose.level'};
+  push @attrs, 'user.mmfs.version' if $fn eq '/';
   # Dat: getfattr(1) `getfattr -d' needs the "user.mmfs." prefix
   if ($fn eq '/root' or !defined($real=sub_to_real($fn))) {
     # Dat: `meta/root' is also a fakenode, since it doesn't have a valid
@@ -2084,7 +2085,7 @@ sub my_listxattr($) {
     push @attrs, 'user.mmfs.description'; # Dat: lazy here, even for files with an empty description
   }
   push @attrs, 0; # $errno indicator
-  #print STDERR "ATTRS=@attrs\n";
+  print STDERR "ATTRS=@attrs\n";
   @attrs
 }
 
@@ -2094,6 +2095,9 @@ sub my_listxattr($) {
 #**      just as if we return the empty string when @tags==0
 sub my_getxattr_low($$) {
   my($fn,$attrname)=@_;
+  if ($attrname eq 'user.mmfs.version' and $fn eq '/') {
+    return $VERSION
+  }
   my $real=sub_to_real($fn);
   # Imp: maybe return non-zero errno
   if ($attrname eq 'user.mmfs.fakenode') {

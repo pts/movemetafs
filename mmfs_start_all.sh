@@ -25,7 +25,7 @@ if test -d "${HOME}/mmfs/tag"; then
   :
 else
   screen -d -m ./mmfs_fuse.pl
-  LEFT=3
+  LEFT=5
   until test -d "${HOME}/mmfs/tag"; do
     test "$LEFT" = 0 && exit 12
     sleep 1
@@ -50,6 +50,12 @@ if GOT="`2>&1 true </dev/rfsdelta-event`"; then
 elif test "$GOT" = "${GOT#*evice or resource busy*}"; then
   # Dat: other error
   exit 15
+elif test "$GOT" = "${GOT#*ermission denied*}"; then
+  # Dat: not chmodded properly
+  exit 16
+else
+  # Dat: other error
+  exit 17
 fi
 
 : All services started OK

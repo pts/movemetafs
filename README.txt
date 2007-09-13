@@ -1284,6 +1284,9 @@ Improvement possibilites
 !! verify: syntax of recreate.sql
 !! feature: search for tags only in this dir
 !! feature: remove unknown tags without errors
-
-
+!! feature: grep, xargs for a specific search query in a folder
+   faster then _mmfs_grep (use st_ino and the database)
+!! bugfix: GETATTR /home/guests/pts/mmfs/root/home/guests/pts/d/pr/anulu_12-05-06_2247b.jpg
+!! bugfix: GETATTR(/root/home/guests/pts/mmfs) hangs
+!! bugfix: tag file creations (in case of deleted inode number gets  repeated)
 __END__
