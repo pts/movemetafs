@@ -59,7 +59,7 @@ use DBI;
 #use DBD::mysql; # Dat: automatic for DBI->connect
 
 use vars qw($VERSION); # Dat: see also CVS ID 
-BEGIN { $VERSION='0.07' }
+BEGIN { $VERSION='0.08' }
 
 # --- Configuration functions
 
@@ -110,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.26 2007-09-13 08:02:49 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.27 2007-09-13 09:19:25 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -1439,18 +1439,21 @@ END { cleanup_umount(); }
 
 #** Removes /root/, prepends $config{'root.prefix'}.
 #** @return undef if not starting with root (or if result would start with
-#**   $config{'mount.point'}); filename otherwise
+#**   $config{'mount.point'}); filename otherwise. May end with a slash.
+#**   Double slashes are not inserted.
 sub sub_to_real($) {
   my $fn=$_[0];
-  return undef if $fn!~s@\A/root(?=/|\Z(?!\n))@@;
+  return undef if $fn!~s@\A/root(?:/+|\Z(?!\n))@@;
+  die if substr($config{'root.prefix'},-1) ne '/';
   ## Dat: now substr($fn,0,1) eq '/', so an empty root_prefix would yield /
-  substr($fn,0,0)=(0==length($config{'root.prefix'})) ? '.' : $config{'root.prefix'};
-  $fn="/" if 0==length($fn);
+  substr($fn,0,0)=(0==length($config{'root.prefix'})) ? './' : $config{'root.prefix'};
+  #$fn="/" if 0==length($fn);
   #print STDERR "SUB_TO_REAL() real=$fn\n";
   my $mpoint=$config{'mount.point'};
   return (substr($fn,0,length($mpoint)) eq $mpoint and
     (length($fn)==length($mpoint) or substr($fn,length($mpoint),1)eq"/") ) ?
-    undef : $fn
+    undef : # Dat: to avoid infinite loops, disable $HOME/mmfs/root/$HOME/mmfs
+    $fn
 }
 
 #** @return undef on syntax error
@@ -1499,6 +1502,8 @@ sub Errno::ENOATTR() { Errno::ENODATA }
 #**        GETATTR(/root/etc)
 #**        GETATTR(/root/etc/fstab)
 sub my_getattr($) {
+  #die sub_to_real("/root/tmp");
+  #die sub_to_real("/root/$ENV{HOME}/mmfs");
   # Dat: no problem of faking a setuid bit: fusermount is nosuid by default
   my $fn=$_[0];
   my $real;
@@ -1526,6 +1531,7 @@ sub my_getattr($) {
   } elsif ($fn eq '/root') {
   } elsif (defined($real=sub_to_real($fn))) {
     # Dat: rofs also uses lstat() instead of stat()
+    #print STDERR "real=($real)\n";
     my @L=lstat($real);
     return -1*$! if !@L;
     ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)=@L;
@@ -1558,6 +1564,12 @@ sub my_getattr($) {
   }
   ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)
 }
+
+#sub my_getattr2($) {
+#  my @L=&my_getattr(@_);
+#  print STDERR "GETATTR(@_) -> @L\n";
+#  @L
+#}
 
 #** Dat: GETATTR is not called before getdir...
 #** Dat: the process readdir(3) receives dirs in exactly reverse order
@@ -2173,6 +2185,7 @@ sub my_removexattr($$) {
 
 # --- main()
 
+print STDERR "This is movemetafs v$VERSION server by <pts\@fazekas.hu>\n";
 die "config already read\n" if @config_argv;
 config_reread();
 

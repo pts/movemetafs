@@ -1067,6 +1067,53 @@ Why did we choose Perl?
 
 -- It is easy to add logging facilities to Perl scripts.
 
+File manager integration
+~~~~~~~~~~~~~~~~~~~~~~~~
+Midnight Commander
+""""""""""""""""""
+Installation:
+
+-- Append mmfs.mc.menu to your ~/.mc/menu. Restart Midnight Commander.
+
+Usage:
+
+-- Press <F2> <S> to show tags on selected files or current file.
+
+-- Press <F2> <T> to modify tags on selected files or current file. The
+   string you specify in the dialog box is treated as a
+   whitespace-separated list of user.mmfs.tags.modify items: tags with
+   the `+' prefix or without a prefix are added, tags with the `-' prefix
+   are removed.
+
+-- You can also use the fixprincipal functionality from within <F2>.
+
+Shell command line
+""""""""""""""""""
+Installation:
+
+-- Use bash or zsh as your shell.
+
+-- Make sure that the file mmfs_shell_functions.sh is sourced. (E.g. add
+   `source .../mmfs_shell_functions.sh' to your ~/.bashrc).
+
+Usage:
+
+-- Use `_mmfs_show <filename> ...' to show tags on the files specified.
+
+-- Use `_mmfs_tag <taglist> <filename> ...' to modify tags on the files
+   specidied. <taglist> is a
+   whitespace-separated list of user.mmfs.tags.modify items.
+
+-- Use `_mmfs_fixprincipal <filename> ...' to use the fixprincipal
+  functionality on the files spacified.
+
+-- Use `ls | _mmfs_grep <taglist>' to select files with the specified
+   tags. This is slow. Taglist is a list of tags with the `+' or `-'
+   prefixes. The `+' prefix is optional.
+
+-- Use `_mmfs_dump <filename> ...' to dump movemetafs tag information as a
+   list of `setfattr' command invocations.
+
 How to contribute
 ~~~~~~~~~~~~~~~~~
 -- Integrate movemetafs.pl tagging and searching functionality to:
