@@ -27,7 +27,9 @@ GRANT Select,Insert,Update,Delete ON movemetafs.* TO 'movemetafs_rw'@'localhost'
 DROP TABLE IF EXISTS files;
 -- Imp: what if sizeof(st_ino)>sizeof(INTEGER)?
 -- Imp: later add sum_sha1 BINARY(40),
--- Dat: principal doesn't start with slash, and it is not empty
+-- Dat: xprincipal doesn't start with slash, and it is not empty;
+--      it is like .32/foo/bar/f.txt: filesystem .32, directory foo/bar,
+--      file f.txt
 -- Dat: descr is a free text description of the file (UTF-8)
 -- Dat: we use VARBINARY because we don't want to convert filenames to UTF-8
 -- Dat: fs can contain only ASCII (0..127) chars, except for `:'
@@ -40,7 +42,7 @@ DROP TABLE IF EXISTS files;
 -- SUXX: `Specified key was too long; max key length is 767 bytes' (for UNIQUE indexes),
 --       so we avoid UNIQUE indexes
 CREATE TABLE files (
-  principal VARBINARY(32000) NOT NULL,
+  xprincipal VARBINARY(32000) NOT NULL,
   shortname VARBINARY(255) NOT NULL UNIQUE,
   shortprincipal VARBINARY(255) NOT NULL,
   ino INTEGER UNSIGNED NOT NULL,
@@ -48,7 +50,7 @@ CREATE TABLE files (
   ts TIMESTAMP NOT NULL DEFAULT NOW(),
   descr TEXT NOT NULL,
   INDEX(shortprincipal),
-  INDEX(principal(32000)),
+  INDEX(xprincipal(32000)),
   UNIQUE(ino,fs),
   INDEX(ts),
 ) ENGINE=InnoDB;
@@ -94,7 +96,9 @@ DROP TABLE IF EXISTS fss;
 CREATE TABLE fss (
   id INTEGER UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   fs VARBINARY(127) NOT NULL UNIQUE,
-  dev INTEGER UNSIGNED NOT NULL UNIQUE
+  last_dev INTEGER UNSIGNED NOT NULL UNIQUE,
+  uuid VARBINARY(127) NOT NULL,
+  INDEX(uuid)
 ) ENGINE=InnoDB;
 -- !!
 --   root_ino INTEGER UNSIGNED NOT NULL,

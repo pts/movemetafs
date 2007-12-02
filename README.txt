@@ -1142,8 +1142,26 @@ If you experience something unexpected or counterintuitive when using
 movemetafs.pl, try to reproduce it in the most simple configuration
 possible, and send your report in e-mail to Péter Szabó <pts@fazekas.hu>.
 
+Examples
+""""""""
+mysql> SELECT xprincipal, GROUP_CONCAT(tags.tag ORDER BY tag SEPARATOR ' ')
+  AS tags FROM files, tags WHERE files.fs='.13' AND tags.fs=files.fs AND
+  tags.ino=files.ino GROUP by tags.fs, tags.ino LIMIT 1000;
+
+mysql> DELETE FROM files WHERE fs='.13';
+
+mysql> DELETE FROM fss WHERE fs='.13';
+
+mysql> DELETE FROM taggings WHERE fs='.13';
+
+mysql> DELETE FROM tags WHERE fs='.13';
+
 Improvement possibilites
 ~~~~~~~~~~~~~~~~~~~~~~~~
+!! enhancement: upon fs transfer, no need to
+   UPDATE fss SET dev=64514 WHERE fs='F';
+   and restart mmfs_fuse.pl
+!! bugfix: rename folders => rename contained filename in the database
 !! feature: tag alias symlinks
 !! test: rename across mount points with GNU mv(1). GNU mv(1) doesn't seem
    to preserve extended attributes

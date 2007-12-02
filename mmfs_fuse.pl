@@ -47,7 +47,7 @@
 # Dat: both , and AND are good for SQL UPDATE ... SET ...
 # Dat: `CREATE TABLE tags_backup AS SELECT * FROM tags;' doesn't copy indexes
 # Dat: policy: my_*() functions don't call db_*(), but only mydb_() directly
-# Dat: policy: we never search `WHERE principal=?' because of files with
+# Dat: policy: we never search `WHERE xprincipal=?' because of files with
 #      multiple hard links
 #
 package MMFS;
@@ -59,7 +59,7 @@ use DBI;
 #use DBD::mysql; # Dat: automatic for DBI->connect
 
 use vars qw($VERSION); # Dat: see also CVS ID 
-BEGIN { $VERSION='0.08' }
+BEGIN { $VERSION='0.09' }
 
 # --- Configuration functions
 
@@ -110,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.27 2007-09-13 09:19:25 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.28 2007-12-02 16:20:37 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -420,14 +420,14 @@ sub verify_tag_query_string($) {
   undef
 }
 
-sub mydb_test($) {
+sub mydb_test() {
   db_connect();
   print STDERR "Database connect OK.\n";
   # vvv !! keep this up-to-date
-  db_do("SELECT principal,shortname, shortprincipal,ino,fs,descr FROM files WHERE 1=2 LIMIT 1");
+  db_do("SELECT xprincipal,shortname,shortprincipal,ino,fs,descr FROM files WHERE 1=2 LIMIT 1");
   db_do("SELECT ino,fs,tagtxt FROM taggings WHERE 1=2 LIMIT 1");
   db_do("SELECT ino,fs,tag FROM tags WHERE 1=2 LIMIT 1");
-  db_do("SELECT fs,mpoint,dev,root_ino,top_ino FROM fss WHERE 1=2 LIMIT 1");
+  db_do("SELECT id,fs,last_dev,uuid FROM fss WHERE 1=2 LIMIT 1");
   # vvv Dat: test write access
   db_do("UPDATE taggings SET ino=ino WHERE 1=2 LIMIT 1");
   db_do("DELETE FROM taggings WHERE 1=2 LIMIT 1");
@@ -580,9 +580,9 @@ my %dev_to_fs;
 
 sub mydb_fill_dev_to_fs() {
   print STDERR "DB_FILL_DEV_TO_FS\n" if $config{'verbose.level'};
-  my $sth=db_query("SELECT dev, fs FROM fss");
+  my $sth=db_query("SELECT last_dev, fs, uuid FROM fss");
   %dev_to_fs=();
-  while (my($dev,$fs)=$sth->fetchrow_array()) {
+  while (my($dev,$fs,$uuid)=$sth->fetchrow_array()) {
     $dev_to_fs{$dev}=$fs
   }
 }
@@ -614,7 +614,8 @@ sub mydb_insert_fs($;$) {
       }
       db_do("DELETE FROM fss WHERE fs=''") if 0==length($fs);
       # vvv Imp: robust, what if already inserted?
-      db_do("INSERT INTO fss (fs,dev) VALUES (?,?)", $fs, $dev);
+      # !! uuid
+      db_do("INSERT INTO fss (fs,last_dev) VALUES (?,?)", $fs, $dev);
       if (0==length($fs)) {
         $fs=$dbh->{'mysql_insertid'};
         die "bad insertid: $fs.\n" if !defined($fs) or $fs<1;
@@ -664,15 +665,15 @@ sub mydb_file_st_to_fs_ino($$;$) {
 sub mydb_insert_fs_ino_principal($$$) {
   my($fs,$ino,$principal)=@_;
   # vvv Imp: is COUNT(*) or LIMIT 1 faster?
-  # vvv Dat: we mustn't check for `AND principal=$principal' here, because of
+  # vvv Dat: we mustn't check for `AND xprincipal=$principal' here, because of
   #     files with multiple hard links
   if (0==db_query_all("SELECT COUNT(*) FROM files WHERE ino=? AND fs=?", $ino, $fs)->[0][0]) {
     # Dat: with transactions, this ensures that the same $principal is not inserted twice (really?? !! test it)
     my($shortprincipal,$shortname)=mydb_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
     # !! what if `principal' and `fs--ino' gets out of sync?
-    #    ON DUPLICATE KEY [principal] UPDATE principal=?, shortname=VALUES(shortname), shortprincipal=VALUES(shortprincipal)
+    #    ON DUPLICATE KEY [principal] UPDATE xprincipal=?, shortname=VALUES(shortname), shortprincipal=VALUES(shortprincipal)
     #print STDERR "INO=$ino\n";
-    db_do("INSERT INTO files (principal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?,?)",
+    db_do("INSERT INTO files (xprincipal,shortname,shortprincipal,ino,fs) VALUES (?,?,?,?,?)",
       $principal, $shortname, $shortprincipal, $ino, $fs); # Dat: this shouldn't die()
   }
 }
@@ -737,7 +738,7 @@ sub mydb_rename_fn($$) {
       #      do anything.
       print STDERR "DB_RENAME_FN unknown fs localname=($localname)\n" if $config{'verbose.level'};
       $dir_p=0;
-    } elsif (!@{$L=db_query_all("SELECT principal FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
+    } elsif (!@{$L=db_query_all("SELECT xprincipal FROM files WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) {
       if (@{db_query_all("SELECT 1 FROM tags WHERE ino=? AND fs=? LIMIT 1", $ino, $fs)}) { # maybe we have it in `tags'
         print STDERR "DB_RENAME_FN reinsert tagged\n" if $config{'verbose.level'};
         mydb_ensure_fs_ino_name($fs,$ino,$localname);
@@ -745,7 +746,7 @@ sub mydb_rename_fn($$) {
       # vvv Imp: avoid $dir_p in race condition with mmfs_rfsdelta_watcher.pl
       $oldprincipal_calc=$oldlocalname if $dir_p;
     } else {
-      $oldprincipal_calc=$L->[0][0];
+      $oldprincipal_calc=$L->[0][0]; # xprincipal
       my $oldshortprincipal=$oldprincipal_calc;
       $oldshortprincipal=~s@\A.*/@@s;
       shorten_with_ext_bang($oldshortprincipal);
@@ -759,10 +760,10 @@ sub mydb_rename_fn($$) {
       my $principal_likeq=$oldprincipal_calc;
       $principal_likeq=~s@([\%_\\])@\\$1@g; # Imp: mysql_likeq()
       # vvv Dat: no proper escape for sprintf() debug message below
-      #print STDERR sprintf("DB_RENAME_FN UPDATE files SET principal=CONCAT('%s',SUBSTRING(BINARY principal FROM %d)) WHERE principal LIKE '%s'\n",
       #  $localname, 1+length($oldprincipal_calc), "$principal_likeq/%");
       # vvv Dat: BINARY doesn't seem to ruin our character encoding
-      my $rv=db_do("UPDATE files SET principal=CONCAT(?,SUBSTRING(BINARY principal FROM ?)) WHERE principal LIKE ?",
+      # !! xprincipal
+      my $rv=db_do("UPDATE files SET xprincipal=CONCAT(?,SUBSTRING(BINARY xprincipal FROM ?)) WHERE xprincipal LIKE ?",
         $localname, 1+length($oldprincipal_calc), "$principal_likeq/%");
       print STDERR "DB_RENAME_FN subdir contents rv=$rv\n" if $config{'verbose.level'};
     }
@@ -777,13 +778,13 @@ sub mydb_rename_fn_low($$$$$) {
   my $rv;
   if ($oldshortprincipal eq $shortprincipal) { # Dat: shortcut: last filename component doesn't change
     print STDERR "DB_RENAME_FN QUICK TO principal=($principal) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
-    $rv=db_do("UPDATE files SET principal=? WHERE ino=? AND fs=?",
+    $rv=db_do("UPDATE files SET xprincipal=? WHERE ino=? AND fs=?",
       $principal, $ino, $fs); # Dat: might have no effect
     print STDERR "DB_RENAME_FN QUICK TO principal=($principal) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
   } else {
     print STDERR "DB_RENAME_FN TO principal=($principal) ino=$ino fs=($fs)\n" if $config{'verbose.level'};
     ($shortprincipal1,$shortname1)=mydb_gen_shorts($principal,$fs,$ino); # Dat: this modifies the db and it might die()
-    $rv=db_do("UPDATE files SET principal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
+    $rv=db_do("UPDATE files SET xprincipal=?, shortprincipal=?, shortname=? WHERE ino=? AND fs=?",
       $principal, $shortprincipal1, $shortname1, $ino, $fs); # Dat: might have no effect
     print STDERR "DB_RENAME_FN TO principal=($principal) shortprincipal=($shortprincipal1) shortname=($shortname1) ino=$ino fs=($fs) affected=$rv\n" if $config{'verbose.level'};
   }
@@ -802,8 +803,8 @@ sub mydb_rename_fn_low($$$$$) {
 sub mydb_fn_is_principal($) {
   my($fn)=@_;
   my $principal=$fn;
-  die "not a mirrored filename\n" if $principal!~s@\A/root/+@@;
-  @{db_query_all("SELECT 1 FROM files WHERE principal=? LIMIT 1",$principal)} ? 1 : 0
+  die "not a mirrored filename\n" if $principal!~s@\A/root/+@@; # !! root
+  @{db_query_all("SELECT 1 FROM files WHERE xprincipal=? LIMIT 1",$principal)} ? 1 : 0
 }
 
 #** Does a simple scan on the string.
@@ -818,10 +819,10 @@ sub spec_symlink_get_shortname($) {
 #** @return :String localname (principal for `tag/.../...') or undef
 sub mydb_fn_to_localname($) {
   my($fn)=@_;
-  return $fn if $fn=~s@\A/root/+@@;
+  return $fn if $fn=~s@\A/root/+@@; # !! root
   my $shortname=spec_symlink_get_shortname($fn);
   return undef if !defined $shortname;
-  my $L=db_query_all("SELECT principal FROM files WHERE shortname=?",
+  my $L=db_query_all("SELECT xprincipal FROM files WHERE shortname=?",
     $shortname);
   print STDERR "DB_FN_TO_LOCALNAME shortname=($shortname) got=$L (@$L).\n" if $config{'verbose.level'};
   @$L ? $L->[0][0] : undef
@@ -1035,7 +1036,7 @@ sub mydb_find_files_matching($) {
 
 sub mydb_get_principal($) {
   my $shortname=$_[0];
-  my $R=db_query_all("SELECT principal FROM files WHERE shortname=? LIMIT 1",
+  my $R=db_query_all("SELECT xprincipal FROM files WHERE shortname=? LIMIT 1",
     $shortname);
   @$R ? $R->[0][0] : undef
 }
@@ -1045,9 +1046,10 @@ sub mydb_get_principal($) {
 sub mydb_file_get_tags($) {
   my($fn)=@_;
   my $localname=$fn;
+  # !! root
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
   # Dat: this is wrong if a file has multiple links:
-  #      return map { $_->[0] } @{db_query_all("SELECT tag FROM tags, files WHERE principal=? AND files.ino=tags.ino AND files.fs=tags.fs ORDER BY tag",$localname)};
+  #      return map { $_->[0] } @{db_query_all("SELECT tag FROM tags, files WHERE xprincipal=? AND files.ino=tags.ino AND files.fs=tags.fs ORDER BY tag",$localname)};
   my($fs,$ino)=mydb_file_localname_to_fs_ino($localname,0,1); # Dat: this might die()
   return () if !defined $fs;
   map { $_->[0] } @{db_query_all("SELECT tag FROM tags WHERE ino=? AND fs=? ORDER BY tag",
@@ -1059,6 +1061,7 @@ sub mydb_file_get_descr($) {
   my($fn)=@_;
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  # !! root
   my($fs,$ino)=mydb_file_localname_to_fs_ino($localname,0,1); # Dat: this might die()
   return undef if !defined $fs;
   my $L=db_query_all("SELECT descr FROM files WHERE ino=? AND fs=? LIMIT 1",
@@ -1071,6 +1074,7 @@ sub mydb_file_set_descr($$) {
   my($fn,$descr)=@_;
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  # !! root
   verify_utf8($descr);
   $descr=~s@\s+\Z(?!\n)@@;
   $descr=~s@\A\s+@@;
@@ -1093,6 +1097,7 @@ sub mydb_file_set_tagtxt($$$) {
   my $localname=$fn;
   my $all_tags={};
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@; # Dat: no need for doing this on symlinks
+  # !! root
   print STDERR "DB_FILE_SET_TAGTXT localname=($localname) tagtxt=($tagtxt) setmode=($setmode)\n" if $config{'verbose.level'};
   if ($setmode eq 'modify') {
     if ($tagtxt!~m@\A\s*-:all\s*\Z(?!\n)@) {
@@ -1224,6 +1229,7 @@ sub mydb_unlink_last($;$$$$) {
   my $localname=$fn;
   die "not a mirrored filename\n" if $localname!~s@\A/root/+@@ and
     !defined $st_ino;
+  # !! root
   my $extrastr=defined$st_ino ? " st_dev=$st_dev st_ino=$st_ino" : "";
   print STDERR "DB_UNLINK_LAST @{[$by_principal_p?qq(principal):qq(localname)]}=($localname)$extrastr\n" if $config{'verbose.level'};
   db_transaction(sub {
@@ -1235,7 +1241,7 @@ sub mydb_unlink_last($;$$$$) {
         !defined $fs;
     } elsif (!$by_principal_p) {
       ($fs,$ino)=mydb_file_localname_to_fs_ino($localname,1,1);
-    } elsif (!@{$L=db_query_all("SELECT fs, ino FROM files WHERE principal=?", $localname)}) {
+    } elsif (!@{$L=db_query_all("SELECT fs, ino FROM files WHERE xprincipal=?", $localname)}) {
       print STDERR "DB_UNLINK_LAST principal-not-in-files\n";
     } else {
       ($fs,$ino)=@{$L->[0]};
@@ -1279,11 +1285,11 @@ sub mydb_attr_dump($$) {
   db_do("SET SESSION group_concat_max_len = $db_big_31bit");
   my $prefixq=$prefix;
   $prefixq=~s@([%_\\])@\\$1@g; # Imp: likeq() Dat: MySQL-specific quoting for LIKE # Imp: more metachars?
-  my $sth=db_query("SELECT principal, descr,
+  my $sth=db_query("SELECT xprincipal, descr,
     GROUP_CONCAT(tag ORDER BY tag SEPARATOR ' ')
     FROM files LEFT OUTER JOIN tags ON
          files.ino=tags.ino AND files.fs=tags.fs
-    WHERE principal LIKE ?
+    WHERE xprincipal LIKE ?
     GROUP BY files.ino, files.fs", $prefixq.'%');
   # ^^^ Dat: MySQL is smart enough to optimize away `x LIKE '%''
   my($principal,$descr,$tags);
@@ -1437,13 +1443,16 @@ END { cleanup_umount(); }
 #$SIG{QUIT}=\&exit_signal;
 # Dat: don't hook QUIT
 
-#** Removes /root/, prepends $config{'root.prefix'}.
+#** Converts a FUSE callback filename (starting with /) to a real filename on
+#** the local disk by
+#** removeing /root/ and then prepending $config{'root.prefix'}.
 #** @return undef if not starting with root (or if result would start with
 #**   $config{'mount.point'}); filename otherwise. May end with a slash.
 #**   Double slashes are not inserted.
 sub sub_to_real($) {
   my $fn=$_[0];
   return undef if $fn!~s@\A/root(?:/+|\Z(?!\n))@@;
+  # !! root
   die if substr($config{'root.prefix'},-1) ne '/';
   ## Dat: now substr($fn,0,1) eq '/', so an empty root_prefix would yield /
   substr($fn,0,0)=(0==length($config{'root.prefix'})) ? './' : $config{'root.prefix'};
@@ -1462,7 +1471,7 @@ sub colonfn_to_fn($) {
   my($fn)=@_; $fn=~s@:(.)@ $1 eq 's' ? '/' : $1 @ges;
   return undef if substr($fn,0,1) eq '/' or
     substr($fn,-1) eq '/' or 0<=index($fn,'//');
-  substr($fn,0,0)="/root/";
+  substr($fn,0,0)="/root/"; # !! root
   $fn
 }
 
@@ -1720,7 +1729,7 @@ sub my_unlink($) {
     my($st_dev,$st_ino,$st_mode,$st_nlink)=lstat($real);
     if (defined $st_nlink and $st_nlink>1) {
       # ^^^ Dat: this check has a race condition only
-      $localname=$fn; $localname=~s@\A/root/@@;
+      $localname=$fn; $localname=~s@\A/root/@@; # !! root
       $linklocalname=hard_link_cache_get($localname);
       if (!defined $linklocalname or !file_stat_localname_is($linklocalname,$st_dev,$st_ino)) {
         hard_link_cache_delete($localname) if defined $localname;
@@ -1732,7 +1741,7 @@ sub my_unlink($) {
     }
     return -1*$! if !unlink($real);
     if (defined $linklocalname) {
-      eval { mydb_rename_fn($fn,"/root/".$linklocalname) };
+      eval { mydb_rename_fn($fn,"/root/".$linklocalname) }; # !! root
       return diemsg_to_nerrno() if $@;
       hard_link_cache_delete($localname);
     } elsif (defined $st_nlink and $st_nlink==1) {
@@ -1827,7 +1836,7 @@ sub myhelper_fixunlink($$$$) {
   my($localname,$linklocalname);
   if (defined $st_nlink and $st_nlink>1) {
     # ^^^ Dat: this check has a race condition only
-    $localname=$fn; $localname=~s@\A/root/@@;
+    $localname=$fn; $localname=~s@\A/root/@@; # !! root
     $linklocalname=hard_link_cache_get($localname);
     if (!defined $linklocalname or !file_stat_localname_is($linklocalname,$st_dev,$st_ino)) {
       hard_link_cache_delete($localname) if defined $localname;
@@ -1841,7 +1850,7 @@ sub myhelper_fixunlink($$$$) {
   }
   #return -1*$! if !unlink($real); # Dat: already done
   if (defined $linklocalname) {
-    eval { mydb_rename_fn($fn,"/root/".$linklocalname) };
+    eval { mydb_rename_fn($fn,"/root/".$linklocalname) }; # !! root
     return diemsg_to_nerrno() if $@;
     hard_link_cache_delete($localname);
   } elsif (defined $st_nlink and $st_nlink==1) {
@@ -1906,12 +1915,13 @@ sub my_symlink($$) {
       my $oldfn=$target;
       return -1*Errno::EINVAL if substr($oldfn,0,1) ne '/' or
         substr($oldfn,-1) eq '/' or 0<=index($oldfn,'//');
-      substr($oldfn,0,0)="/root";
+      substr($oldfn,0,0)="/root"; # !! root
       if ($action eq 'fixrename') {
         print STDERR "FIXRENAME oldfn=($oldfn) fn=($fn)\n" if $config{'verbose.level'};
         eval { mydb_rename_fn($oldfn,$fn); };
         return diemsg_to_nerrno()
       } else {
+        # !! root
         if ($oldfn=~s@\A/root/+@@ and $fn=~s@\A/root/+@@) {
           # DatL hard_link_cache_set() reports: print STDERR "ADD TO LINK CACHE oldfn=($oldfn) fn=($fn)\n" if $config{'verbose.level'};
           hard_link_cache_set($oldfn,$fn);
@@ -1938,6 +1948,7 @@ sub my_link($$) {
   } elsif (!link($oldreal,$real)) {
     return -1*$!
   } else {
+    # !! root
     if ($oldfn=~s@\A/root/+@@ and $fn=~s@\A/root/+@@) {
       # Dat: save $oldfn in case unlink($fn) is soon to follow
       # vvv Imp: maybe verify whether $fn is a principal etc.
@@ -2031,6 +2042,8 @@ sub my_readlink($) {
       #print STDERR "SS $shortname\n";
       my $principal=eval { mydb_get_principal($shortname) };
       return diemsg_to_nerrno() if $@;
+      # !! xprincipal symlink
+      # !! root
       return defined($principal) ? "../../root/$principal" : -1*Errno::ENOENT
     }
     return -1*Errno::EPERM
@@ -2211,6 +2224,7 @@ $config{'root.prefix'}=~s@\A/+@/@;
 #  #die "all_dev=$all_dev\n";
 #}
 db_connect();
+mydb_test();
 mydb_fill_dev_to_fs();
 
 system('fusermount -u -- '.fnq($config{'mount.point'}).' 2>/dev/null'); # Imp: hide only not-mounted errors, look at /proc/mounts

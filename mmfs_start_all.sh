@@ -7,11 +7,22 @@
 MYDIR="${0%/*}"; test "$MYDIR" = "$0" && MYDIR=.
 set -ex
 cd "$MYDIR"
+
+test -w .
+test -w mysqldbdir
+type -p fusermount
+test -x "`type -p fusermount`"
+perl -MFuse -MDBD::mysql -e0
+# vvv Dat: Transport endpoint not connected for `test -d'
+#test -d "$HOME/mmfs" ||
+mkdir -p "$HOME/mmfs" || true
+#test -d "$HOME/mmfs"
+
 if perl -mIO::Socket::UNIX -e 'die $! if !IO::Socket::UNIX->new("mysqldbdir/our.sock")'; then
   :
 else
   # vvv Imp: check for already running etc
-  screen -d -m mysqldbdir/mysqld_run.sh
+  screen -S mmfs_mysqld -d -m mysqldbdir/mysqld_run.sh
   LEFT=10
   # vvv Dat: give mysqld time to come up
   until perl -mIO::Socket::UNIX -e 'die $! if !IO::Socket::UNIX->new("mysqldbdir/our.sock")'; do
@@ -24,7 +35,8 @@ fi
 if test -d "${HOME}/mmfs/tag"; then
   :
 else
-  screen -d -m ./mmfs_fuse.pl
+  ./mmfs_fuse.pl --test-db
+  screen -S mmfs_fuse -d -m ./mmfs_fuse.pl
   LEFT=5
   until test -d "${HOME}/mmfs/tag"; do
     test "$LEFT" = 0 && exit 12
@@ -33,9 +45,11 @@ else
   done
 fi
 
-if test -e /proc/rfsdelta-event; then
+if test -e /proc/rfsdelta-event && test -r /dev/rfsdelta-event; then
   :
 else
+  # Dat: to /etc/sudoers:
+  #      pts ALL = NOPASSWD: /usr/local/sbin/rfsdelta-pts.sh
   sudo /usr/local/sbin/rfsdelta-pts.sh
   test -e /proc/rfsdelta-event || exit 15
   test -c /dev/rfsdelta-event || exit 13
@@ -44,7 +58,7 @@ test -r /dev/rfsdelta-event || exit 14 # Imp: euid
 
 if GOT="`2>&1 true </dev/rfsdelta-event`"; then
   # Dat: nobody is reading it, no `Device 
-  screen -d -m ./mmfs_rfsdelta_watcher.pl
+  screen -S mmfs_rfsdelta -d -m ./mmfs_rfsdelta_watcher.pl
   # vvv Imp: try to open after 3 seconds, avoid deadlock
   #while GOT="`2>&1 true </dev/rfsdelta-event`"
 elif test "$GOT" = "${GOT#*evice or resource busy*}"; then
