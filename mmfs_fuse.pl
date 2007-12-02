@@ -110,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.28 2007-12-02 16:20:37 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.29 2007-12-02 19:12:07 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -247,6 +247,214 @@ sub verify_utf8($) {
   my($S)=@_;
   die "bad UTF-8 string\n" if $S!~/\A(?:[\000-\177]+|[\xC0-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF7][\x80-\xBF]{3})*\Z(?!\n)/;
   undef
+}
+
+# --- Filesystem UUID handling
+
+sub find_on_path_nocur($;$) {
+  my $cmd=$_[0];
+  if ($cmd=~m@/@) {
+    return $cmd if -f $cmd;
+    return undef;
+  }
+  my $path=defined($_[1]) ? $_[1] : $ENV{PATH};
+  return undef if !defined $path;
+  # Imp: empty $ENV{PATH} etc.
+  for my $dir (split/:+/,$path) {
+    next if 0==length($dir) or $dir eq '.';
+    $dir.=(0==length$dir)?"./":"/";
+    return $dir.$cmd if -f $dir.$cmd; # Dat: glibc uses -f(or -e?), not -x
+  }
+  undef
+}
+
+#** @param $_[0] :ArrayRef(String) list of device names
+#** @return :HashRef(String=>String) device name to UUID (readable).
+#**   For filesystems whose UUID cannot be determined, a string starting with
+#**   '?' is substituted.
+#** Dat: both dumpfsuuid and vol_id print the lowercase hexdump for reiserfs,
+#        good.
+sub devs_to_uuid($) {
+  my $M={};
+  my %devs=map{$_=>1} @{$_[0]};
+  if (%devs) {
+    # Imp: find many, on with suid bit
+    my $dumpfsuuid=(find_on_path_nocur('dumpfsuuid') or
+      find_on_path_nocur('dumpfsuuid', '/usr/local/sbin'));
+    if (defined $dumpfsuuid) {
+      my @cmd=($dumpfsuuid, sort keys %devs);
+      my $cmdq=join('  ',map{fnq$_} @cmd);
+      my $pipe;
+      die if !open($pipe, "$cmdq|");
+      my $line;
+      while (defined($line=<$pipe>)) {
+        if ($line=~/^\A(.*): (.*)$/ and exists $devs{$1}) {
+          $M->{$1}=$2;
+          delete $devs{$1};
+        }
+      }
+      close($pipe);
+    }
+  }
+
+  if (%devs) {
+    # Imp: find many, on with suid bit
+    my $vol_id=(find_on_path_nocur('vol_id') or
+      find_on_path_nocur('vol_id', '/usr/local/sbin:/lib/udev'));
+    my @cmd_prefix;
+    if (defined $vol_id) {
+      if ($> !=0) { # Dat: non-root
+        my($dev,$ino,$mode,$nlink,$uid)=stat($vol_id);
+        if (!defined $uid) {
+          $vol_id=undef;
+        } elsif ($uid!=0 || ($mode&04711)!=04711) { # Imp: more precise 0111 check
+          # Dat: setuid bit not set, try sudo
+          my $pipe;
+          my $pid=open($pipe, "sudo -l -p 'Password--:\n' -S </dev/null 2>&1|");
+          die if !$pid;
+          my $line;
+          my $found_p=0;
+          while (defined($line=<$pipe>)) {
+            last if $line eq "Password--:\n"; # Dat: don't wait
+            if ($line=~/^ *\(root\) +NOPASSWD: *\Q$vol_id\E *$/) {
+              $found_p=1; last;
+            }
+          }
+          kill('KILL', $pid); # Dat: shortcut
+          close($pipe); # Dat: might fail (e.g. sudo exit(>0))
+          if ($found_p) {
+            push @cmd_prefix, 'sudo';
+          } else {
+            $vol_id=undef;
+          }
+        }
+      }
+    }
+    if (defined $vol_id) {
+      for my $dev (sort keys %devs) {
+        my @cmd=(@cmd_prefix, $vol_id, '--export', '--', $dev);
+        my $cmdq=join('  ',map{fnq$_} @cmd);
+        my $pipe;
+        die if !open($pipe, "$cmdq|");
+        my $line;
+        # Dat: we don't get a useful error message (only `error open volume')
+        #      if no uuid
+        while (defined($line=<$pipe>)) {
+          if ($line=~/^ID_FS_UUID=(.*)$/) {
+            $M->{$dev}=$1;
+            delete $devs{$dev};
+          }
+        }
+        close($pipe);
+      }
+    }
+  }
+
+  for my $dev (sort keys %devs) { $M->{$dev}='?' }
+  $M
+}
+
+#** @return :ArrayRef(HashRef)
+#** @example push @fs, { dev=>'/dev/sda3', devnr=>0x803, dir=>'/', uuid=>'...' };
+sub dirlist_to_fs($) {
+  my $fs=[];
+  for my $dev (@{$_[0]}) {
+    my($devnr,$ino,$mode,$nlink,$uid,$gid,$rdev)=stat($dev);
+    #die if !defined $rdev; # Dat: e.g. permission denied
+    push @$fs, {
+      dev=>$dev,
+      dir=>undef,
+      devnr=>(defined $rdev && $rdev>0 ? $rdev : undef),
+    };
+  }
+  $fs
+}
+
+#** Imp: a way to reload on request...
+my %devdevs;
+#** @return :ArrayRef(HashRef)
+#** @example push @fs, { dev=>'/dev/sda3', devnr=>0x803, dir=>'/', uuid=>'...' };
+sub list_mounts() {
+  my @fs;
+  my $F;
+  die if !open($F, '<', '/proc/mounts');
+  my $line;
+  #** e.g. $devdevs{0x803}='/dev/sda3';
+  while (defined($line=<$F>)) {
+    my($dev,$dir,$fstype,$extras)=split(/ /,$line,4);
+    next if !defined($extras);
+    next if $fstype eq 'rootfs' or $fstype eq 'fuse';
+    next if substr($dev,0,1) ne '/';
+    my $devnr;
+ 
+    # Try to guess device name.
+    if (!(-b $dev) and $!{ENOENT}) { # Dat: e.g. '/dev/root'
+      # Dat: we don't find LVM here -- never mind
+      my $dev2;
+      ($devnr)=lstat($dir); # Imp: what if permission denied? (e.g. /dev/VG/... for LVM)
+      if (defined $devnr) {
+        if ($devnr<0x300) { }
+        elsif ($devnr==0x300) { $dev2='/dev/hda' }
+        elsif ($devnr <0x340) { $dev2='/dev/hda'.($devnr&63) }
+        elsif ($devnr==0x340) { $dev2='/dev/hdb' }
+        elsif ($devnr <0x380) { $dev2='/dev/hdb'.($devnr&63) }
+        elsif ($devnr==0x380) { $dev2='/dev/hdc' }
+        elsif ($devnr <0x3c0) { $dev2='/dev/hdc'.($devnr&63) }
+        elsif ($devnr==0x3c0) { $dev2='/dev/hdd' }
+        elsif ($devnr <0x400) { $dev2='/dev/hdd'.($devnr&63) }
+        elsif ($devnr <0x800) { }
+        elsif ($devnr==0x800) { $dev2='/dev/sda' }
+        elsif ($devnr <0x810) { $dev2='/dev/sda'.($devnr&15) }
+        elsif ($devnr==0x810) { $dev2='/dev/sdb' }
+        elsif ($devnr <0x820) { $dev2='/dev/sdb'.($devnr&15) }
+        elsif ($devnr==0x820) { $dev2='/dev/sdc' }
+        elsif ($devnr <0x830) { $dev2='/dev/sdc'.($devnr&15) }
+        elsif ($devnr==0x830) { $dev2='/dev/sdd' }
+        elsif ($devnr <0x840) { $dev2='/dev/sdd'.($devnr&15) }
+        elsif ($devnr==0x840) { $dev2='/dev/sde' }
+        elsif ($devnr <0x850) { $dev2='/dev/sde'.($devnr&15) }
+        elsif ($devnr==0x850) { $dev2='/dev/sdf' }
+        elsif ($devnr <0x860) { $dev2='/dev/sdf'.($devnr&15) }
+        elsif ($devnr <0x920) { $dev2='/dev/md'.($devnr&31) }
+        else { }
+        
+        if (!defined $dev2) {
+          if (!%devdevs) {
+            $devdevs{''}=undef; # Dat: make it nonempty
+            my $dir;
+            if (opendir($dir, '/dev')) {
+              my $e;
+              while (defined($e=readdir($dir))) {
+                my $dev3="/dev/$e";
+                if (-b $dev3) {
+                  my($devnr,$ino,$mode,$nlink,$uid,$gid,$rdev)=stat(_);
+                  die if !defined $rdev;
+                  $devdevs{$rdev}=$dev3;
+                  print "$dev3; $rdev\n";
+                }
+              }
+            }
+            closedir($dir);
+          }
+          $dev2=$devdevs{$devnr} if defined $devdevs{$devnr};
+        }
+        $dev=$dev2 if defined $dev2;
+      }
+    } else {
+      my($devnr2,$ino,$mode,$nlink,$uid,$gid,$rdev)=stat(_);
+      die if !defined($rdev);
+      die if $rdev<1;
+      $devnr=$rdev;
+    }
+    
+    push @fs, {
+      dev=>$dev,
+      dir=>$dir,
+      devnr=>$devnr,
+    };
+  }
+  close($F);
+  \@fs
 }
 
 # --- Generic MySQL database functions
@@ -547,7 +755,7 @@ sub mydb_gen_shorts($$$) {
     substr($shortname1,0,0)=$prepend1; # Dat: not largefile-safe
     shorten_with_ext_bang($shortname1);
     print STDERR "SIMILAR SHORTNAME CHANGING TO $shortname1.\n" if $config{'verbose.level'};
-    push @sql_updates, ["UPDATE files SET shortname=? WHERE ino=? AND fs=?",
+    push @sql_updates, ['UPDATE files SET shortname=? WHERE ino=? AND fs=?',
       $shortname1, $ino1, $fs1] if $shortname1 ne $shortname0;
   }
   undef $sth;
@@ -578,12 +786,69 @@ sub verify_localname($) {
 #** Test with `defined' (not `exists') because of @db_on_die_rollback.
 my %dev_to_fs;
 
+#** Cache of the table `fss'.
+#** Test with `defined' (not `exists') because of @db_on_die_rollback.
+my %dev_to_uuid;
+
 sub mydb_fill_dev_to_fs() {
   print STDERR "DB_FILL_DEV_TO_FS\n" if $config{'verbose.level'};
-  my $sth=db_query("SELECT last_dev, fs, uuid FROM fss");
-  %dev_to_fs=();
-  while (my($dev,$fs,$uuid)=$sth->fetchrow_array()) {
-    $dev_to_fs{$dev}=$fs
+
+  my %uuid_to_dev;
+  my $fslist=list_mounts();
+  my $dev_to_uuid_detect0=devs_to_uuid([map {$_->{dev}} @$fslist]);
+  my %dev_to_uuid_detect;
+  my %uuid_to_dev_detect;
+
+  db_transaction(sub {
+    my $sth=db_query("SELECT last_dev, fs, uuid FROM fss");
+    %dev_to_fs=();
+
+    for my $fs1 (@$fslist) {
+      my $uuid;
+      if (defined $fs1->{devnr} and
+          defined($uuid=$dev_to_uuid_detect0->{$fs1->{dev}}) and
+          0<length($uuid) and substr($uuid,0,1) ne '?') {
+        $dev_to_uuid_detect{$fs1->{devnr}}=$uuid;
+        $uuid_to_dev_detect{$uuid}=$fs1->{devnr};
+      }
+    }
+    
+    #** SQL UPDATE command hashrefs.
+    my @sql_updates;
+    while (my($dev,$fs,$uuid)=$sth->fetchrow_array()) {
+      $dev_to_fs{$dev}=$fs;
+      if (0==length($uuid) or substr($uuid,0,1) eq '+') {
+        if (defined $dev_to_uuid_detect{$dev}) {
+          print STDERR "DB_FFS_SETUP_UUID dev=$dev fs=$fs uuid=$uuid uuid2=$dev_to_uuid_detect{$dev}\n";
+          $uuid=$dev_to_uuid_detect{$dev};
+          push @sql_updates, ['UPDATE fss SET uuid=? WHERE last_dev=? AND fs=?',
+            $uuid, $dev, $fs];
+        }
+      } else {
+        my $dev2=$uuid_to_dev_detect{$uuid};
+        if (defined $dev2 and $dev2!=$dev) {
+          print STDERR "DB_FFS_FIX_DEV dev=$dev dev2=$dev2 fs=$fs uuid=$uuid\n";
+          push @sql_updates, ['UPDATE fss SET last_dev=? WHERE uuid=? AND fs=? AND last_dev=?',
+            $dev2, $uuid, $fs, $dev];
+          $dev=$dev2;
+        }
+        if (exists $uuid_to_dev{$uuid}) {
+          $uuid_to_dev{$uuid}=''; # mark multiple value
+        } else {
+          $uuid_to_dev{$uuid}=$dev;
+        }
+      }
+    }
+
+    #print STDERR "SQU=(@{$sql_updates[0]} ...)\n";
+    for my $sql (@sql_updates) { &db_do(@$sql) }
+  }, 1);
+
+  # !! update this when calling in mydb_insert_fs()
+  %dev_to_uuid=();
+  for my $uuid (sort keys %uuid_to_dev) {
+    my $dev=$uuid_to_dev{$uuid};
+    $dev_to_uuid{$dev}=$uuid if 0<length($dev);
   }
 }
 
@@ -592,7 +857,12 @@ sub mydb_rollback_dev_to_fs($) {
   return if $dbh->{AutoCommit};
   my($dev)=@_;
   my $oldfs=$dev_to_fs{$dev};
-  push @db_on_die_rollback, sub { $dev_to_fs{$dev}=$oldfs; undef };
+  my $olduuid=$dev_to_uuid{$dev};
+  push @db_on_die_rollback, sub {
+    $dev_to_fs{$dev}=$oldfs;
+    $dev_to_uuid{$dev}=$olduuid;
+    undef
+  };
 }
 
 #** Dat: needs transaction
