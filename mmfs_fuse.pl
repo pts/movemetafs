@@ -110,7 +110,7 @@ sub config_process_option($) {
   elsif ($opt eq '--verbose') { $config{'verbose.level'}++ }
   elsif ($opt eq '--quiet'  ) { $config{'verbose.level'}-- }
   elsif ($opt eq '--version') {
-    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.29 2007-12-02 19:12:07 pts Exp $'."\n";
+    print STDERR "movemetafs v$VERSION".' $Id: mmfs_fuse.pl,v 1.30 2008-01-20 17:25:49 pts Exp $'."\n";
     print STDERR "by Pe'ter Szabo' since early January 2007\n";
     print STDERR "The license is GNU GPL >=2.0. It comes without warranty. USE AT YOUR OWN RISK!\n";
     exit 0
@@ -388,61 +388,65 @@ sub list_mounts() {
     my $devnr;
  
     # Try to guess device name.
-    if (!(-b $dev) and $!{ENOENT}) { # Dat: e.g. '/dev/root'
-      # Dat: we don't find LVM here -- never mind
-      my $dev2;
-      ($devnr)=lstat($dir); # Imp: what if permission denied? (e.g. /dev/VG/... for LVM)
-      if (defined $devnr) {
-        if ($devnr<0x300) { }
-        elsif ($devnr==0x300) { $dev2='/dev/hda' }
-        elsif ($devnr <0x340) { $dev2='/dev/hda'.($devnr&63) }
-        elsif ($devnr==0x340) { $dev2='/dev/hdb' }
-        elsif ($devnr <0x380) { $dev2='/dev/hdb'.($devnr&63) }
-        elsif ($devnr==0x380) { $dev2='/dev/hdc' }
-        elsif ($devnr <0x3c0) { $dev2='/dev/hdc'.($devnr&63) }
-        elsif ($devnr==0x3c0) { $dev2='/dev/hdd' }
-        elsif ($devnr <0x400) { $dev2='/dev/hdd'.($devnr&63) }
-        elsif ($devnr <0x800) { }
-        elsif ($devnr==0x800) { $dev2='/dev/sda' }
-        elsif ($devnr <0x810) { $dev2='/dev/sda'.($devnr&15) }
-        elsif ($devnr==0x810) { $dev2='/dev/sdb' }
-        elsif ($devnr <0x820) { $dev2='/dev/sdb'.($devnr&15) }
-        elsif ($devnr==0x820) { $dev2='/dev/sdc' }
-        elsif ($devnr <0x830) { $dev2='/dev/sdc'.($devnr&15) }
-        elsif ($devnr==0x830) { $dev2='/dev/sdd' }
-        elsif ($devnr <0x840) { $dev2='/dev/sdd'.($devnr&15) }
-        elsif ($devnr==0x840) { $dev2='/dev/sde' }
-        elsif ($devnr <0x850) { $dev2='/dev/sde'.($devnr&15) }
-        elsif ($devnr==0x850) { $dev2='/dev/sdf' }
-        elsif ($devnr <0x860) { $dev2='/dev/sdf'.($devnr&15) }
-        elsif ($devnr <0x920) { $dev2='/dev/md'.($devnr&31) }
-        else { }
-        
-        if (!defined $dev2) {
-          if (!%devdevs) {
-            $devdevs{''}=undef; # Dat: make it nonempty
-            my $dir;
-            if (opendir($dir, '/dev')) {
-              my $e;
-              while (defined($e=readdir($dir))) {
-                my $dev3="/dev/$e";
-                if (-b $dev3) {
-                  my($devnr,$ino,$mode,$nlink,$uid,$gid,$rdev)=stat(_);
-                  die if !defined $rdev;
-                  $devdevs{$rdev}=$dev3;
-                  print "$dev3; $rdev\n";
+    if (!(-b $dev)) {
+      if ($!{ENOENT}) { # Dat: e.g. '/dev/root'
+        # Dat: we don't find LVM here -- never mind
+        my $dev2;
+        ($devnr)=lstat($dir); # Imp: what if permission denied? (e.g. /dev/VG/... for LVM)
+        if (defined $devnr) {
+          if ($devnr<0x300) { }
+          elsif ($devnr==0x300) { $dev2='/dev/hda' }
+          elsif ($devnr <0x340) { $dev2='/dev/hda'.($devnr&63) }
+          elsif ($devnr==0x340) { $dev2='/dev/hdb' }
+          elsif ($devnr <0x380) { $dev2='/dev/hdb'.($devnr&63) }
+          elsif ($devnr==0x380) { $dev2='/dev/hdc' }
+          elsif ($devnr <0x3c0) { $dev2='/dev/hdc'.($devnr&63) }
+          elsif ($devnr==0x3c0) { $dev2='/dev/hdd' }
+          elsif ($devnr <0x400) { $dev2='/dev/hdd'.($devnr&63) }
+          elsif ($devnr <0x800) { }
+          elsif ($devnr==0x800) { $dev2='/dev/sda' }
+          elsif ($devnr <0x810) { $dev2='/dev/sda'.($devnr&15) }
+          elsif ($devnr==0x810) { $dev2='/dev/sdb' }
+          elsif ($devnr <0x820) { $dev2='/dev/sdb'.($devnr&15) }
+          elsif ($devnr==0x820) { $dev2='/dev/sdc' }
+          elsif ($devnr <0x830) { $dev2='/dev/sdc'.($devnr&15) }
+          elsif ($devnr==0x830) { $dev2='/dev/sdd' }
+          elsif ($devnr <0x840) { $dev2='/dev/sdd'.($devnr&15) }
+          elsif ($devnr==0x840) { $dev2='/dev/sde' }
+          elsif ($devnr <0x850) { $dev2='/dev/sde'.($devnr&15) }
+          elsif ($devnr==0x850) { $dev2='/dev/sdf' }
+          elsif ($devnr <0x860) { $dev2='/dev/sdf'.($devnr&15) }
+          elsif ($devnr <0x920) { $dev2='/dev/md'.($devnr&31) }
+          else { }
+          
+          if (!defined $dev2) {
+            if (!%devdevs) {
+              $devdevs{''}=undef; # Dat: make it nonempty
+              my $dir;
+              if (opendir($dir, '/dev')) {
+                my $e;
+                while (defined($e=readdir($dir))) {
+                  my $dev3="/dev/$e";
+                  if (-b $dev3) {
+                    my($devnr,$ino,$mode,$nlink,$uid,$gid,$rdev)=stat(_);
+                    die if !defined $rdev;
+                    $devdevs{$rdev}=$dev3;
+                    print "$dev3; $rdev\n";
+                  }
                 }
               }
+              closedir($dir);
             }
-            closedir($dir);
+            $dev2=$devdevs{$devnr} if defined $devdevs{$devnr};
           }
-          $dev2=$devdevs{$devnr} if defined $devdevs{$devnr};
+          $dev=$dev2 if defined $dev2;
         }
-        $dev=$dev2 if defined $dev2;
+      } else {
+        $devnr=undef;
       }
     } else {
       my($devnr2,$ino,$mode,$nlink,$uid,$gid,$rdev)=stat(_);
-      die if !defined($rdev);
+      die "error: cannot stat: $dev: $!\n" if !defined($rdev);
       die if $rdev<1;
       $devnr=$rdev;
     }
@@ -872,7 +876,7 @@ sub mydb_insert_fs($;$) {
   my($dev,$fs)=@_;
   print STDERR "DB_INSERT_FS dev=$dev\n" if $config{'verbose.level'};
   db_transaction(sub {
-    my $L=db_query_all("SELECT fs FROM fss WHERE dev=? LIMIT 1", $dev);
+    my $L=db_query_all("SELECT fs FROM fss WHERE last_dev=? LIMIT 1", $dev);
     if (@$L) { # Dat: somebody has inserted it
       $fs=$L->[0][0];
     } else {
