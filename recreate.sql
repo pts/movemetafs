@@ -52,7 +52,7 @@ CREATE TABLE files (
   INDEX(shortprincipal),
   INDEX(xprincipal(32000)),
   UNIQUE(ino,fs),
-  INDEX(ts),
+  INDEX(ts)
 ) ENGINE=InnoDB;
 
 -- Dat: tagtxt: `q' or something else is appended to words separated by space,

@@ -175,7 +175,8 @@ not as root.
    http://freshmeat.net/projects/movemetafs/
 2. Install the dependencies (see above).
 3. Load the `fuse' kernel module. If not found, compile or install it, and
-   reboot if necessary. Test with `grep "^fuse " /proc/modules'.
+   reboot if necessary. Test with `grep "^fuse " /proc/modules'. On
+   Debian Lenny, you also have to run `sudo chmod 4755 /usr/bin/fusermount'.
 4. Extract the distribution tarball and chdir() to the folder just extracted.
    You will be running `mmfs_fuse.pl' from here.
 5. Copy the file `movemetafs.conf.ex' to `movemetafs.conf'.
